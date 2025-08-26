@@ -1,6 +1,6 @@
 # RoentGen-v2: Improving Performance, Robustness, and Fairness of Radiographic AI Models with Finely-Controllable Synthetic Data
 
-[![Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-md.svg)](https://huggingface.co/stanfordmimi/RoentGen-v2) [![arXiv](https://img.shields.io/badge/arXiv-2502.14753-b31b1b.svg?style=for-the-badge)](https://arxiv.org/abs/2508.16783) [![License](https://img.shields.io/github/license/stanfordmimi/RoentGen-v2?style=for-the-badge)](LICENSE)
+[![Hugging Face](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-md.svg)](https://huggingface.co/stanfordmimi/RoentGen-v2) [![arXiv](https://img.shields.io/badge/arXiv-2508.16783-b31b1b.svg?style=for-the-badge)](https://arxiv.org/abs/2508.16783) [![License](https://img.shields.io/github/license/stanfordmimi/RoentGen-v2?style=for-the-badge)](LICENSE)
 
 ## 🧨Inference with diffusers
 
