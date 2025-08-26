@@ -74,3 +74,19 @@ accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
  roentgenv2/train_code/train.py \
  --config_file="./configs/train_config_demo.yaml"
 ```
+
+## 📎 Citation
+
+If you find this repository useful for your work, please cite the following paper:
+
+```bibtex
+@misc{moroianu2025improvingperformancerobustnessfairness,
+      title={Improving Performance, Robustness, and Fairness of Radiographic AI Models with Finely-Controllable Synthetic Data}, 
+      author={Stefania L. Moroianu and Christian Bluethgen and Pierre Chambon and Mehdi Cherti and Jean-Benoit Delbrouck and Magdalini Paschali and Brandon Price and Judy Gichoya and Jenia Jitsev and Curtis P. Langlotz and Akshay S. Chaudhari},
+      year={2025},
+      eprint={2508.16783},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2508.16783}, 
+}
+```
