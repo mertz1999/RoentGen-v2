@@ -18,7 +18,7 @@ image = pipe(prompt).images[0]
 ```
 
 ## 🩻 Synthetic CXR Dataset
-To be released soon, stay tuned.
+565k synthetic chest radiographs generated with RoentGen-v2 available on HuggingFace [here](https://huggingface.co/datasets/stanfordmimi/RoentGen-v2-synthetic-dataset).
 
 ![Visuals](assets/visual_examples.png)
 
