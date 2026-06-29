@@ -59,9 +59,131 @@ accelerate launch --num_processes=4 --multi-gpu --mixed_precision bf16 \
  --config_file="./configs/infer_config_demo.yaml"
 ```
 
-### Finetuning Instructions
+### LoRA Finetuning on Your Own Images
 
-In order to finetune RoentGen-v2 on your own dataset, follow the instructions below.
+This fork includes a lightweight LoRA fine-tuning script that uses
+[`stanfordmimi/RoentGen-v2`](https://huggingface.co/stanfordmimi/RoentGen-v2)
+as the base model and saves only LoRA adapter weights.
+
+#### 1. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+If you are using Colab, install a CUDA-compatible PyTorch build if needed:
+
+```bash
+pip install --upgrade torch torchvision torchaudio xformers --index-url https://download.pytorch.org/whl/cu126
+```
+
+#### 2. Log in to Hugging Face
+
+RoentGen-v2 is a gated model. Accept the model terms on Hugging Face first, then log in:
+
+```bash
+hf auth login
+```
+
+#### 3. Prepare the dataset
+
+The LoRA script expects two flat folders: one for images and one for prompts. Each image must have a matching `.txt` file with the same basename.
+
+```text
+/content/temp_dataset_for_zip/images_512x512/
+  case001.jpg
+  case002.png
+
+/content/temp_dataset_for_zip/reports/
+  case001.txt
+  case002.txt
+```
+
+Example prompt file:
+
+```text
+50 year old female. Normal chest radiograph.
+```
+
+Supported image extensions are `.jpg`, `.jpeg`, and `.png`.
+
+#### 4. Check the config
+
+The default LoRA config is:
+
+```text
+configs/train_lora_roentgen.yaml
+```
+
+It uses these default paths:
+
+```yaml
+image_dir: "/content/temp_dataset_for_zip/images_512x512"
+prompt_dir: "/content/temp_dataset_for_zip/reports"
+output_dir: "/content/drive/MyDrive/Projects/data/xray/train_01"
+```
+
+The default training settings are intended for limited-GPU Colab training:
+
+```yaml
+resolution: 512
+train_batch_size: 1
+gradient_accumulation_steps: 4
+mixed_precision: fp16
+gradient_checkpointing: true
+lora_rank: 8
+lora_alpha: 8
+resume_from_checkpoint: "latest"
+```
+
+#### 5. Start LoRA fine-tuning
+
+```bash
+accelerate launch roentgenv2/train_code/train_lora.py \
+  --config_file configs/train_lora_roentgen.yaml
+```
+
+The script saves checkpoints in:
+
+```text
+/content/drive/MyDrive/Projects/data/xray/train_01/checkpoint-*
+```
+
+If training stops, run the exact same command again. Because the config has:
+
+```yaml
+resume_from_checkpoint: "latest"
+```
+
+training will resume from the newest checkpoint in the same `output_dir`.
+
+Final LoRA weights are saved to:
+
+```text
+/content/drive/MyDrive/Projects/data/xray/train_01/lora
+```
+
+#### 6. Use the fine-tuned LoRA for inference
+
+```python
+import torch
+from diffusers import DiffusionPipeline
+
+pipe = DiffusionPipeline.from_pretrained(
+    "stanfordmimi/RoentGen-v2",
+    torch_dtype=torch.float16,
+)
+pipe = pipe.to("cuda")
+
+pipe.load_lora_weights("/content/drive/MyDrive/Projects/data/xray/train_01/lora")
+
+prompt = "50 year old female. Normal chest radiograph."
+image = pipe(prompt).images[0]
+```
+
+### Full Finetuning Instructions
+
+The original full UNet fine-tuning script is still available, but it needs more GPU memory than LoRA fine-tuning.
 ```bash
 accelerate launch --num_processes=1 --mixed_precision bf16 \
  roentgenv2/train_code/train.py \
