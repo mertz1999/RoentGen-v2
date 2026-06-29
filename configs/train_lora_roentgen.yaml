@@ -1,0 +1,47 @@
+pretrained_model_name_or_path: "stanfordmimi/RoentGen-v2"
+revision: null
+variant: null
+use_auth_token: null
+cache_dir: null
+
+image_dir: "/content/temp_dataset_for_zip/images_512x512"
+prompt_dir: "/content/temp_dataset_for_zip/reports"
+output_dir: "/content/drive/MyDrive/Projects/data/xray/train_01"
+
+resolution: 512
+train_batch_size: 1
+gradient_accumulation_steps: 4
+mixed_precision: fp16
+gradient_checkpointing: true
+learning_rate: 1.0e-4
+scale_lr: false
+lr_scheduler: cosine
+lr_warmup_steps: 100
+max_train_steps: 1000
+num_train_epochs: 100
+max_train_samples: null
+
+lora_rank: 8
+lora_alpha: 8
+lora_dropout: 0.0
+train_text_encoder_lora: false
+
+seed: 873
+dataloader_num_workers: 0
+use_8bit_adam: false
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.0e-2
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+allow_tf32: false
+enable_xformers_memory_efficient_attention: true
+prediction_type: null
+noise_offset: 0.0
+
+logging_dir: "logs"
+report_to: wandb
+checkpointing_steps: 100
+checkpoints_total_limit: 5
+resume_from_checkpoint: "latest"
+local_rank: -1
