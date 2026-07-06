@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import math
 import os
@@ -22,7 +23,7 @@ from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision.transforms import Compose, InterpolationMode, Normalize, Resize, ToTensor
+from torchvision.transforms import CenterCrop, Compose, InterpolationMode, Normalize, Resize, ToTensor
 from tqdm.auto import tqdm
 
 check_min_version("0.35.0")
@@ -76,6 +77,12 @@ class LoRATrainConfig:
     prediction_type: str = None
     noise_offset: float = 0.0
 
+    # --- preprocessing / evaluation / metrics additions ---
+    image_transform: str = "center_crop"   # "center_crop" (recommended) or "pad" (old black-letterbox)
+    val_split: float = 0.0                  # fraction of pairs held out for validation loss (0 disables)
+    validation_steps: int = 0               # compute + log validation loss every N steps (0 disables)
+    metrics_file: str = "metrics.json"      # loss / validation curve data written here (under output_dir)
+
     logging_dir: str = "logs"
     report_to: str = "wandb"
     checkpointing_steps: int = 100
@@ -98,10 +105,42 @@ class SquarePad:
         return F.pad(image, (pad_left, pad_right, pad_top, pad_bottom), "constant", 0)
 
 
+def build_image_transforms(resolution, mode="center_crop"):
+    """Build the image preprocessing pipeline.
+
+    center_crop (recommended): resize the shorter side to `resolution`, then take a
+      centered square crop. Produces a full-bleed square X-ray with no borders,
+      matching how RoentGen-v2 / MIMIC frames were prepared. Preferred for FID.
+    pad: the original behaviour -- letterbox to a square with BLACK bars, then
+      resize. Kept only for reproducing old runs; the black borders are an
+      out-of-distribution artifact that inflates FID, so avoid for real training.
+    """
+    if mode == "center_crop":
+        return Compose(
+            [
+                ToTensor(),
+                Resize(resolution, interpolation=InterpolationMode.BILINEAR),  # shorter side -> resolution
+                CenterCrop(resolution),                                        # centered square crop
+                Normalize([0.5], [0.5]),
+            ]
+        )
+    if mode == "pad":
+        return Compose(
+            [
+                ToTensor(),
+                SquarePad(),
+                Resize(resolution, interpolation=InterpolationMode.BILINEAR),
+                Normalize([0.5], [0.5]),
+            ]
+        )
+    raise ValueError(f"Unknown image_transform mode: {mode!r} (use 'center_crop' or 'pad').")
+
+
 class ImagePromptDirectoryDataset(Dataset):
     image_extensions = {".jpg", ".jpeg", ".png"}
 
-    def __init__(self, image_dir, prompt_dir, tokenizer, resolution, max_train_samples=None):
+    def __init__(self, image_dir, prompt_dir, tokenizer, resolution, max_train_samples=None,
+                 transform_mode="center_crop"):
         self.image_dir = Path(image_dir)
         self.prompt_dir = Path(prompt_dir)
         self.tokenizer = tokenizer
@@ -132,14 +171,7 @@ class ImagePromptDirectoryDataset(Dataset):
                 "and each image basename must have a matching .txt prompt file."
             )
 
-        self.image_transforms = Compose(
-            [
-                ToTensor(),
-                SquarePad(),
-                Resize(resolution, interpolation=InterpolationMode.BILINEAR),
-                Normalize([0.5], [0.5]),
-            ]
-        )
+        self.image_transforms = build_image_transforms(resolution, transform_mode)
 
     def __len__(self):
         return len(self.samples)
@@ -220,6 +252,86 @@ def save_lora_weights(accelerator, unet, save_directory):
         unet_lora_layers=unet_lora_state_dict,
         safe_serialization=True,
     )
+
+
+class MetricsLogger:
+    """Accumulates loss / validation curve data and writes it to a JSON file.
+
+    Schema (consumed by plot_metrics.py):
+        {
+          "meta":  {...run hyperparameters...},
+          "train": {"step": [...], "loss": [...], "lr": [...]},
+          "val":   {"step": [...], "loss": [...]}
+        }
+    """
+
+    def __init__(self, path, meta=None):
+        self.path = path
+        self.data = {
+            "meta": meta or {},
+            "train": {"step": [], "loss": [], "lr": []},
+            "val": {"step": [], "loss": []},
+        }
+
+    def log_train(self, step, loss, lr):
+        self.data["train"]["step"].append(int(step))
+        self.data["train"]["loss"].append(float(loss))
+        self.data["train"]["lr"].append(float(lr))
+
+    def log_val(self, step, loss):
+        self.data["val"]["step"].append(int(step))
+        self.data["val"]["loss"].append(float(loss))
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(self.data, handle, indent=2)
+
+
+@torch.no_grad()
+def compute_validation_loss(
+    accelerator, unet, vae, text_encoder, noise_scheduler, val_dataloader, weight_dtype, seed
+):
+    """Mean diffusion MSE over the held-out set.
+
+    Uses a fixed-seed generator for the noise and timesteps so the value is
+    comparable across steps (a true 'is the loss going down' signal, not noise).
+    """
+    was_training = unet.training
+    unet.eval()
+    device = accelerator.device
+    generator = torch.Generator(device=device).manual_seed(seed)
+    losses = []
+    for batch in val_dataloader:
+        pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+        input_ids = batch["input_ids"].to(device)
+
+        latents = vae.encode(pixel_values).latent_dist.sample(generator=generator)
+        latents = latents * vae.config.scaling_factor
+        encoder_hidden_states = text_encoder(input_ids, return_dict=False)[0]
+
+        noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
+        timesteps = torch.randint(
+            0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],),
+            generator=generator, device=device,
+        ).long()
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        gathered = accelerator.gather(loss.repeat(pixel_values.shape[0]))
+        losses.append(gathered.mean().item())
+
+    if was_training:
+        unet.train()
+    return sum(losses) / max(len(losses), 1)
 
 
 def main(args):
@@ -337,15 +449,32 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = ImagePromptDirectoryDataset(
+    full_dataset = ImagePromptDirectoryDataset(
         image_dir=args.image_dir,
         prompt_dir=args.prompt_dir,
         tokenizer=tokenizer,
         resolution=args.resolution,
         max_train_samples=args.max_train_samples,
+        transform_mode=args.image_transform,
     )
+
+    val_dataset = None
+    if args.val_split and args.val_split > 0.0:
+        val_size = max(1, int(round(len(full_dataset) * args.val_split)))
+        train_size = len(full_dataset) - val_size
+        split_generator = torch.Generator().manual_seed(args.seed)
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size], generator=split_generator
+        )
+    else:
+        train_dataset = full_dataset
+
     if accelerator.is_main_process:
-        logger.info(f"Matched image/prompt pairs: {len(train_dataset)}")
+        n_val = len(val_dataset) if val_dataset is not None else 0
+        logger.info(
+            f"Matched pairs: {len(full_dataset)} | train: {len(train_dataset)} | val: {n_val} "
+            f"| image_transform: {args.image_transform}"
+        )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -353,6 +482,14 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -376,6 +513,21 @@ def main(args):
 
     if accelerator.is_main_process:
         accelerator.init_trackers("roentgen-v2-lora", config=args.get_config())
+
+    metrics = MetricsLogger(
+        os.path.join(args.output_dir, args.metrics_file),
+        meta={
+            "learning_rate": args.learning_rate,
+            "lr_scheduler": args.lr_scheduler,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "train_batch_size": args.train_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "max_train_steps": args.max_train_steps,
+            "image_transform": args.image_transform,
+            "val_split": args.val_split,
+        },
+    )
 
     global_step = 0
     first_epoch = 0
@@ -467,8 +619,25 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                current_lr = lr_scheduler.get_last_lr()[0]
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    metrics.log_train(global_step, train_loss, current_lr)
                 train_loss = 0.0
+
+                # periodic validation loss (comparable across steps via fixed-seed noise)
+                if val_dataloader is not None and args.validation_steps and (
+                    global_step % args.validation_steps == 0
+                ):
+                    val_loss = compute_validation_loss(
+                        accelerator, unet, vae, text_encoder, noise_scheduler,
+                        val_dataloader, weight_dtype, args.seed,
+                    )
+                    accelerator.log({"val_loss": val_loss}, step=global_step)
+                    if accelerator.is_main_process:
+                        metrics.log_val(global_step, val_loss)
+                        metrics.save()
+                        logger.info(f"step {global_step} | val_loss {val_loss:.5f}")
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -476,9 +645,10 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         save_lora_weights(accelerator, unet, save_path)
+                        metrics.save()
                         logger.info(f"Saved checkpoint to {save_path}")
 
-                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"step_loss": loss.detach().item(), "lr": current_lr}
                 progress_bar.set_postfix(**logs)
 
                 if global_step >= args.max_train_steps:
@@ -491,7 +661,9 @@ def main(args):
     if accelerator.is_main_process:
         final_lora_dir = os.path.join(args.output_dir, "lora")
         save_lora_weights(accelerator, unet, final_lora_dir)
+        metrics.save()
         logger.info(f"Saved final LoRA weights to {final_lora_dir}")
+        logger.info(f"Saved metrics to {metrics.path}")
 
     accelerator.end_training()
 

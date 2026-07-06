@@ -136,6 +136,23 @@ lora_alpha: 8
 resume_from_checkpoint: "latest"
 ```
 
+> **Recommended config.** For a stronger run, use
+> `configs/train_lora_roentgen_recommended.yaml`. It trains longer
+> (`max_train_steps: 6000`), uses a larger effective batch and LoRA rank,
+> enables the validation curve, and uses the `center_crop` preprocessing (below).
+
+**Image preprocessing (`image_transform`).** Chest X-rays are non-square, so they
+must be made square before training. Two modes are available:
+
+```yaml
+image_transform: center_crop   # recommended: resize + centered square crop, no borders
+# image_transform: pad         # legacy: black-letterbox to square (adds black bars)
+```
+
+`center_crop` is preferred because the black bars added by `pad` are an
+out-of-distribution artifact that inflates FID. Use `pad` only to reproduce
+older runs.
+
 #### 5. Start LoRA fine-tuning
 
 ```bash
@@ -180,6 +197,43 @@ pipe.load_lora_weights("/content/drive/MyDrive/Projects/data/xray/train_01/lora"
 prompt = "50 year old female. Normal chest radiograph."
 image = pipe(prompt).images[0]
 ```
+
+#### 7. Monitor training (loss / validation curves)
+
+Training writes a `metrics.json` into `output_dir` (updated at every checkpoint,
+every validation, and at the end):
+
+```json
+{
+  "meta":  { "lora_rank": 16, "learning_rate": 0.0001, "image_transform": "center_crop" },
+  "train": { "step": [...], "loss": [...], "lr": [...] },
+  "val":   { "step": [...], "loss": [...] }
+}
+```
+
+To get a **validation curve**, enable a held-out split in the config:
+
+```yaml
+val_split: 0.05          # hold out 5% of pairs for validation
+validation_steps: 250    # compute + log validation loss every 250 steps
+metrics_file: metrics.json
+```
+
+Validation loss uses fixed-seed noise, so it is comparable across steps (a real
+"is it improving" signal rather than noise).
+
+Turn `metrics.json` into a chart with:
+
+```bash
+python roentgenv2/train_code/plot_metrics.py \
+  --metrics /content/drive/MyDrive/Projects/data/xray/train_recommended/metrics.json \
+  --out training_curve.png --show-lr
+```
+
+The chart shows raw + EMA-smoothed training loss, validation-loss markers, and the
+learning-rate schedule; the command also prints the best validation loss and the
+step it occurred (useful for picking a checkpoint). Options: `--smooth 0.9` (EMA
+factor, `0` = raw), `--show-lr` (overlay LR), `--dpi`.
 
 ### Full Finetuning Instructions
 

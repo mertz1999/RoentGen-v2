@@ -1,0 +1,58 @@
+# Recommended LoRA config for RoentGen-v2 fine-tuning on IU X-Ray
+# (frontal-only images + cleaned <=77-token prompts).
+# Assumes a single ~16GB GPU (Colab). See README / notes for rationale.
+
+pretrained_model_name_or_path: "stanfordmimi/RoentGen-v2"
+revision: null
+variant: null
+use_auth_token: null
+cache_dir: null
+
+# Point these at your frontal-only images and the cleaned reports/<id>.txt files.
+image_dir: "/content/temp_dataset_for_zip/images_512x512"
+prompt_dir: "/content/temp_dataset_for_zip/reports"
+output_dir: "/content/drive/MyDrive/Projects/data/xray/train_recommended"
+
+resolution: 512
+train_batch_size: 1                 # raise to 2 if VRAM allows
+gradient_accumulation_steps: 8      # effective batch = 1 x 8 = 8 (steadier gradients)
+mixed_precision: fp16
+gradient_checkpointing: true
+learning_rate: 1.0e-4               # standard LoRA LR
+scale_lr: false
+lr_scheduler: cosine
+lr_warmup_steps: 200
+max_train_steps: 6000              # ~14 epochs over ~3.3k pairs at eff. batch 8
+num_train_epochs: 100             # ignored when max_train_steps is set (kept for clarity)
+max_train_samples: null
+
+lora_rank: 16                      # more capacity than the old rank 8
+lora_alpha: 16
+lora_dropout: 0.0
+train_text_encoder_lora: false     # leave false until text-encoder LoRA is implemented
+
+# --- preprocessing / evaluation / metrics (new) ---
+image_transform: center_crop       # center_crop (no black bars) | pad (old behaviour)
+val_split: 0.05                    # hold out 5% for a validation-loss curve
+validation_steps: 250              # compute + log val loss every 250 steps
+metrics_file: metrics.json         # written under output_dir; plot with plot_metrics.py
+
+seed: 873
+dataloader_num_workers: 2
+use_8bit_adam: false
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.0e-2
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+allow_tf32: false
+enable_xformers_memory_efficient_attention: true
+prediction_type: null
+noise_offset: 0.0
+
+logging_dir: "logs"
+report_to: wandb
+checkpointing_steps: 500
+checkpoints_total_limit: 5
+resume_from_checkpoint: "latest"
+local_rank: -1
