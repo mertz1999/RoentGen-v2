@@ -9,9 +9,9 @@ use_auth_token: null
 cache_dir: null
 
 # Point these at your frontal-only images and the cleaned reports/<id>.txt files.
-image_dir: "/content/temp_dataset_for_zip/images_512x512"
-prompt_dir: "/content/temp_dataset_for_zip/reports"
-output_dir: "/content/drive/MyDrive/Projects/data/xray/train_recommended"
+image_dir: "/content/xray-database/train/images"
+prompt_dir: "/content/xray-database/train/labels"
+output_dir: "/content/drive/MyDrive/Projects/data/xray/train_05"
 
 resolution: 512
 train_batch_size: 1                 # raise to 2 if VRAM allows
