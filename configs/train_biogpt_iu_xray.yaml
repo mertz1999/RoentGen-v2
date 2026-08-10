@@ -1,0 +1,33 @@
+# BioGPT text stage for the IU X-Ray -> Claude standardized prompt workflow.
+# First run prepare_dataset.py; its JSONL outputs are used below.
+
+model_name_or_path: "microsoft/biogpt"
+train_file: "/content/biogpt-data/train.jsonl"
+validation_file: "/content/biogpt-data/validation.jsonl"
+test_file: "/content/biogpt-data/test.jsonl"
+
+# Change this to a persistent mounted Google Drive folder in Colab.
+output_dir: "/content/drive/MyDrive/Projects/data/xray/biogpt_iu_xray_v1"
+metrics_file: "metrics.json"
+
+# A 16 GB T4-friendly full fine-tune. The loss is computed only on target text.
+max_source_length: 384
+max_target_length: 128
+num_train_epochs: 3
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.10
+lr_scheduler_type: "linear"
+gradient_checkpointing: true
+fp16: true
+
+logging_steps: 10
+eval_steps: 100
+save_steps: 100
+save_total_limit: 3
+resume_from_checkpoint: "latest"
+report_to: "none"
+seed: 873

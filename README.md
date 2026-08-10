@@ -251,6 +251,107 @@ accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
  --config_file="./configs/train_config_demo.yaml"
 ```
 
+### BioGPT text stage: IU X-Ray clinical report → RoentGen prompt
+
+This project uses the proposal's intended order: create the text prompt first,
+then give that generated prompt to RoentGen-v2 to create the synthetic image.
+The text stage fine-tunes the official [`microsoft/biogpt`](https://huggingface.co/microsoft/biogpt)
+checkpoint with the Claude-created `generated_prompt` as its target.
+
+The supplied CSV contains the target prompt *and* the original report from which
+Claude made it. Therefore this training task must be described accurately as
+**clinical-report-to-standardized-prompt distillation**. It does not prove that
+the model can create a report from only an image or a diagnosis. The default
+input contains clinical sections (`indication`, `findings`, `impression`,
+structured labels, and number of images), and deliberately excludes
+`generated_prompt`, report/image identifiers, and cost/token metadata.
+
+The existing folders shown below are the authority for the external split; the
+script never re-randomizes their test examples:
+
+```text
+/content/xray-database/
+  train/images/<id>.png
+  train/labels/<id>.txt
+  test/images/<id>.png
+  test/labels/<id>.txt
+```
+
+The numeric names in your screenshots (for example `1002.png` and `1002.txt`)
+are supported and are validated against CSV report IDs such as `CXR1002` before
+anything is trained. A 10% validation set is sampled only from `train`; `test`
+remains untouched until final evaluation.
+
+#### 1. Install and place the two input folders/files
+
+```bash
+pip install -r requirements.txt
+
+# In Colab, upload/copy the Claude CSV to this path (or change the command).
+# /content/iu_xray_prompts_claude.csv
+# Also make /content/xray-database/{train,test}/{images,labels} available.
+```
+
+#### 2. Prepare leakage-checked text splits
+
+```bash
+python roentgenv2/text_generation/prepare_dataset.py \
+  --csv-file /content/iu_xray_prompts_claude.csv \
+  --xray-database /content/xray-database \
+  --output-dir /content/biogpt-data
+```
+
+Check `/content/biogpt-data/summary.json` before training. It records the exact
+train/validation/test counts, the mapping audit, and whether the existing label
+files exactly match the CSV's Claude targets. The CSV remains canonical; label
+files are audited but are not silently substituted as targets.
+
+If you deliberately want a stricter, less-leaky research variant based only on
+diagnosis/context, replace the default inputs with:
+
+```bash
+--input-fields indication mesh_labels num_images
+```
+
+#### 3. Fine-tune BioGPT and save training metrics
+
+Edit `configs/train_biogpt_iu_xray.yaml` only to set the persistent Google Drive
+`output_dir` you want. Then run:
+
+```bash
+python roentgenv2/text_generation/train_biogpt.py \
+  --config-file configs/train_biogpt_iu_xray.yaml
+```
+
+The default configuration is designed for one 16 GB T4 GPU: batch size 2,
+gradient accumulation 8, FP16, and gradient checkpointing. It writes:
+
+```text
+<output_dir>/checkpoint-*/       resumable checkpoints
+<output_dir>/metrics.json        loss/learning-rate history, validation, final held-out test metrics
+<output_dir>/final_model/        final trained BioGPT model and tokenizer
+<output_dir>/training_config.yaml
+```
+
+Re-run the same command after an interruption. `resume_from_checkpoint: latest`
+finds the newest checkpoint automatically and continues updating the same
+`metrics.json`.
+
+#### 4. Generate test prompts for text-quality evaluation and RoentGen input
+
+```bash
+python roentgenv2/text_generation/generate_reports.py \
+  --model-dir /content/drive/MyDrive/Projects/data/xray/biogpt_iu_xray_v1/final_model \
+  --input-file /content/biogpt-data/test.jsonl \
+  --output-csv /content/drive/MyDrive/Projects/data/xray/biogpt_iu_xray_v1/test_predictions.csv \
+  --max-source-length 384
+```
+
+`test_predictions.csv` contains each held-out target and its BioGPT prediction.
+Use the `prediction` column as the input prompt to RoentGen-v2. Keep this test
+file separate from all training choices; it is what supports the proposal's
+final text-quality and image-text-alignment evaluation.
+
 ## 📎 Citation
 
 If you find this repository useful for your work, please cite the following paper:
