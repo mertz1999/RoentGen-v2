@@ -292,6 +292,13 @@ pip install -r requirements.txt
 # Also make /content/xray-database/{train,test}/{images,labels} available.
 ```
 
+`sacremoses` is included in `requirements.txt` because BioGPT's tokenizer
+requires it. If the environment was installed before this update, run:
+
+```bash
+pip install sacremoses==0.1.1
+```
+
 #### 2. Prepare leakage-checked text splits
 
 ```bash
