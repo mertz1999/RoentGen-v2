@@ -1,0 +1,66 @@
+# MedCLIP image-text alignment evaluation
+
+Run this after RoentGen inference has produced one synthetic image for each
+held-out prompt. It measures whether the generated X-ray matches the same
+BioGPT prompt more closely than a shuffled, incorrect prompt.
+
+Use a fresh Colab runtime. The official MedCLIP package requires
+`transformers<=4.24.0`, while RoentGen-v2 and the BioGPT pipeline use newer
+Transformers versions. Save all model and image outputs to Drive before
+starting this evaluation runtime.
+
+## Inputs
+
+```text
+/content/test_predictions.csv
+  required columns: folder_stem, prediction
+
+/content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/test_generated/
+  3.png, 7.png, ... matching each folder_stem
+```
+
+The generated image directory must contain exactly one image for every CSV row.
+The script stops on duplicate IDs, missing images, blank prompts, or bad CSV
+column names instead of producing a partial score.
+
+## Fresh Colab runtime
+
+```bash
+git clone https://github.com/mertz1999/RoentGen-v2.git
+cd RoentGen-v2
+pip install -r requirements-medclip.txt
+```
+
+Mount Drive and set the paths below to the saved files from the RoentGen run:
+
+```bash
+python roentgenv2/evaluation/medclip_alignment.py \
+  --predictions-csv /content/test_predictions.csv \
+  --generated-image-dir /content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/test_generated \
+  --output-dir /content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/medclip_evaluation \
+  --batch-size 8 \
+  --negative-shuffles 5 \
+  --seed 873
+```
+
+The first run downloads the MedCLIP-ViT weights. Reduce `--batch-size` to `4`
+if the GPU runs out of memory.
+
+## Outputs
+
+```text
+medclip_evaluation/
+  alignment_per_pair.csv        every matched and negative score
+  alignment_summary.json        means, standard deviations, bootstrap CIs, AUROC, retrieval
+  alignment_distribution.png    matched versus negative score distributions
+```
+
+Interpretation:
+
+- `matched.mean` should be higher than `negative.mean`.
+- The confidence interval for `matched_minus_negative.mean` should be above
+  zero, and the one-sided permutation p-value should be small.
+- `matched_vs_negative_auroc` should be above 0.50; higher is better.
+- Do not combine the raw MedCLIP value with raw FID. FID is a global,
+  unbounded distribution score and must be normalized separately for the final
+  HybridScore.

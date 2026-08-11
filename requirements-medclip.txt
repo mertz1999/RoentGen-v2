@@ -1,0 +1,5 @@
+# Install this only in a fresh evaluation environment, never into the active
+# RoentGen/BioGPT training environment. MedCLIP requires Transformers <=4.24.
+git+https://github.com/RyanWangZf/MedCLIP.git@9c3396f20d5d54e4fae241b8cb06ca45848e98c9
+matplotlib>=3.7
+scikit-learn>=1.1.2

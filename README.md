@@ -359,6 +359,15 @@ Use the `prediction` column as the input prompt to RoentGen-v2. Keep this test
 file separate from all training choices; it is what supports the proposal's
 final text-quality and image-text-alignment evaluation.
 
+### MedCLIP image-text alignment evaluation
+
+After generating the held-out synthetic images, use the separate MedCLIP
+evaluation environment. It deliberately runs outside the RoentGen/BioGPT
+environment because MedCLIP requires an older Transformers version. See
+[`docs/medclip-evaluation.md`](docs/medclip-evaluation.md) for the full command
+and output definitions. The script writes per-pair matched and shuffled-negative
+similarities, confidence intervals, AUROC, retrieval results, and a plot.
+
 ## 📎 Citation
 
 If you find this repository useful for your work, please cite the following paper:
