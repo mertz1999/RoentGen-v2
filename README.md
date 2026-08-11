@@ -363,7 +363,7 @@ final text-quality and image-text-alignment evaluation.
 
 After generating the held-out synthetic images, use the separate MedCLIP
 evaluation environment. It deliberately runs outside the RoentGen/BioGPT
-environment because MedCLIP requires an older Transformers version. See
+environment; the supplied requirements support current Python 3.12 Colab. See
 [`docs/medclip-evaluation.md`](docs/medclip-evaluation.md) for the full command
 and output definitions. The script writes per-pair matched and shuffled-negative
 similarities, confidence intervals, AUROC, retrieval results, and a plot.

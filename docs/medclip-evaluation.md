@@ -5,9 +5,11 @@ held-out prompt. It measures whether the generated X-ray matches the same
 BioGPT prompt more closely than a shuffled, incorrect prompt.
 
 Use a fresh Colab runtime. The official MedCLIP package requires
-`transformers<=4.24.0`, while RoentGen-v2 and the BioGPT pipeline use newer
-Transformers versions. Save all model and image outputs to Drive before
-starting this evaluation runtime.
+`transformers<=4.24.0`, whose required `tokenizers` package has no Python 3.12
+wheel. The supplied requirements keep a current Colab-compatible Transformers
+version and the evaluator reproduces MedCLIP's image preprocessing directly.
+Save all model and image outputs to Drive before starting this evaluation
+runtime.
 
 ## Inputs
 
@@ -45,6 +47,13 @@ python roentgenv2/evaluation/medclip_alignment.py \
 
 The first run downloads the MedCLIP-ViT weights. Reduce `--batch-size` to `4`
 if the GPU runs out of memory.
+
+If an older clone is already present, update it before installing:
+
+```bash
+cd /content/RoentGen-v2
+git pull origin main
+```
 
 ## Outputs
 

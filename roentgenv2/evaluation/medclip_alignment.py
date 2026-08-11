@@ -21,6 +21,10 @@ import pandas as pd
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 MEDCLIP_REVISION = "9c3396f20d5d54e4fae241b8cb06ca45848e98c9"
+MEDCLIP_IMAGE_SIZE = 224
+MEDCLIP_IMAGE_MEAN = 0.5862785803043838
+MEDCLIP_IMAGE_STD = 0.27950088968644304
+MEDCLIP_TEXT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 
 
 def package_version(name: str) -> str | None:
@@ -140,6 +144,25 @@ def binary_roc_auc(positive_scores: np.ndarray, negative_scores: np.ndarray) -> 
     return wins / (len(positive_scores) * len(negative_scores))
 
 
+def preprocess_medclip_image(image: "Image.Image") -> np.ndarray:
+    """Reproduce MedCLIP's documented grayscale square-pad/224 normalization.
+
+    The original MedCLIP processor relies on an old Transformers image API.
+    Keeping this small preprocessing implementation here lets the same MedCLIP
+    weights run in current Python 3.12 Colab without downgrading tokenizers.
+    """
+    from PIL import Image
+
+    width, height = image.size
+    size = max(MEDCLIP_IMAGE_SIZE, width, height)
+    canvas = Image.new("L", (size, size), 0)
+    canvas.paste(image, ((size - width) // 2, (size - height) // 2))
+    canvas = canvas.resize((MEDCLIP_IMAGE_SIZE, MEDCLIP_IMAGE_SIZE), resample=Image.Resampling.BICUBIC)
+    pixels = np.asarray(canvas, dtype=np.float32) / 255.0
+    pixels = (pixels - MEDCLIP_IMAGE_MEAN) / MEDCLIP_IMAGE_STD
+    return pixels[None, :, :]
+
+
 def encode_pairs(frame: pd.DataFrame, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
     import torch
     from PIL import Image
@@ -147,13 +170,14 @@ def encode_pairs(frame: pd.DataFrame, batch_size: int) -> tuple[np.ndarray, np.n
     if not torch.cuda.is_available():
         raise RuntimeError("MedCLIP's reference implementation requires a CUDA GPU. Enable a Colab GPU runtime.")
     try:
-        from medclip import MedCLIPModel, MedCLIPProcessor, MedCLIPVisionModelViT
+        from medclip import MedCLIPModel, MedCLIPVisionModelViT
+        from transformers import AutoTokenizer
     except ImportError as error:  # pragma: no cover - depends on isolated Colab environment
         raise RuntimeError(
             "MedCLIP is not installed. Use a fresh Colab runtime and install "
             "requirements-medclip.txt before running this script."
         ) from error
-    processor = MedCLIPProcessor()
+    tokenizer = AutoTokenizer.from_pretrained(MEDCLIP_TEXT_MODEL)
     model = MedCLIPModel(vision_cls=MedCLIPVisionModelViT)
     model.from_pretrained()
     model.cuda().eval()
@@ -166,14 +190,19 @@ def encode_pairs(frame: pd.DataFrame, batch_size: int) -> tuple[np.ndarray, np.n
             images = []
             for path in batch["image_path"]:
                 with Image.open(path) as image:
-                    images.append(image.copy())
-            inputs = processor(
-                images=images,
-                text=batch["prompt"].tolist(),
-                return_tensors="pt",
+                    images.append(preprocess_medclip_image(image))
+            text_inputs = tokenizer(
+                batch["prompt"].tolist(),
                 padding=True,
+                truncation=True,
+                max_length=77,
+                return_tensors="pt",
             )
-            outputs = model(**inputs)
+            outputs = model(
+                pixel_values=torch.tensor(np.stack(images), dtype=torch.float32),
+                input_ids=text_inputs["input_ids"],
+                attention_mask=text_inputs["attention_mask"],
+            )
             image_embeddings.append(outputs["img_embeds"].detach().cpu().numpy())
             text_embeddings.append(outputs["text_embeds"].detach().cpu().numpy())
     return np.concatenate(image_embeddings), np.concatenate(text_embeddings)
@@ -295,6 +324,10 @@ def main() -> None:
             "transformers": package_version("transformers"),
             "medclip": package_version("MedCLIP"),
             "numpy": package_version("numpy"),
+        },
+        "preprocessing": {
+            "image": "grayscale, zero-padded square, bicubic resize to 224x224, MedCLIP normalization",
+            "text": f"{MEDCLIP_TEXT_MODEL}, max_length=77",
         },
         "files": {
             "per_pair": "alignment_per_pair.csv",
