@@ -1,10 +1,8 @@
-# Install this only in a fresh Colab evaluation environment, never into the
-# active RoentGen/BioGPT training environment. The original MedCLIP dependency
-# pin uses tokenizers 0.13, which has no Python 3.12 wheel. We retain Colab's
-# Python-3.12-compatible Transformers and use the equivalent preprocessor in
-# roentgenv2/evaluation/medclip_alignment.py.
---no-deps
-git+https://github.com/RyanWangZf/MedCLIP.git@9c3396f20d5d54e4fae241b8cb06ca45848e98c9
+# Install this only after installing MedCLIP itself with pip's ``--no-deps``
+# command option (see docs/medclip-evaluation.md). The original MedCLIP
+# dependency pin uses tokenizers 0.13, which has no Python 3.12 wheel. We retain
+# Colab's Python-3.12-compatible Transformers and use the equivalent
+# preprocessor in roentgenv2/evaluation/medclip_alignment.py.
 transformers==4.55.4
 tokenizers==0.21.4
 wget==3.2

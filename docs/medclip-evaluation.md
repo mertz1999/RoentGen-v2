@@ -30,7 +30,7 @@ column names instead of producing a partial score.
 ```bash
 git clone https://github.com/mertz1999/RoentGen-v2.git
 cd RoentGen-v2
-pip install -r requirements-medclip.txt
+bash scripts/install_medclip_colab.sh
 ```
 
 Mount Drive and set the paths below to the saved files from the RoentGen run:
