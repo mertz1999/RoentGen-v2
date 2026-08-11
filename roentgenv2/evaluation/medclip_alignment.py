@@ -163,7 +163,41 @@ def preprocess_medclip_image(image: "Image.Image") -> np.ndarray:
     return pixels[None, :, :]
 
 
-def encode_pairs(frame: pd.DataFrame, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
+def load_medclip_vit_weights(model: object, checkpoint_dir: Path) -> None:
+    """Load official MedCLIP weights across old/new Transformers buffer changes.
+
+    Modern Transformers does not persist BioClinicalBERT's ``position_ids``
+    buffer. The original MedCLIP checkpoint includes it, so strict loading
+    fails even though every learned parameter matches. Only that one known
+    obsolete buffer is permitted in the fallback; any learned-weight mismatch
+    still stops evaluation.
+    """
+    import torch
+
+    try:
+        model.from_pretrained(input_dir=str(checkpoint_dir))
+        return
+    except RuntimeError as error:
+        state_path = checkpoint_dir / "pytorch_model.bin"
+        if not state_path.is_file():
+            raise RuntimeError(
+                "MedCLIP checkpoint loading failed before the checkpoint was available. "
+                "Delete the incomplete checkpoint directory and rerun the command."
+            ) from error
+        state_dict = torch.load(state_path, map_location="cpu", weights_only=True)
+        incompatibility = model.load_state_dict(state_dict, strict=False)
+        unexpected = set(incompatibility.unexpected_keys)
+        missing = set(incompatibility.missing_keys)
+        allowed_unexpected = {"text_model.model.embeddings.position_ids"}
+        if missing or unexpected - allowed_unexpected:
+            raise RuntimeError(
+                "MedCLIP checkpoint has an unexpected learned-weight mismatch. "
+                f"Missing: {sorted(missing)}; unexpected: {sorted(unexpected)}"
+            ) from error
+        print("Loaded MedCLIP-ViT with the legacy position_ids buffer safely ignored.")
+
+
+def encode_pairs(frame: pd.DataFrame, batch_size: int, checkpoint_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     import torch
     from PIL import Image
 
@@ -179,7 +213,7 @@ def encode_pairs(frame: pd.DataFrame, batch_size: int) -> tuple[np.ndarray, np.n
         ) from error
     tokenizer = AutoTokenizer.from_pretrained(MEDCLIP_TEXT_MODEL)
     model = MedCLIPModel(vision_cls=MedCLIPVisionModelViT)
-    model.from_pretrained()
+    load_medclip_vit_weights(model, checkpoint_dir)
     model.cuda().eval()
 
     image_embeddings: list[np.ndarray] = []
@@ -239,6 +273,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--permutation-samples", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=873)
+    parser.add_argument(
+        "--medclip-checkpoint-dir",
+        type=Path,
+        default=Path("pretrained/medclip-vit"),
+        help="Cache directory for official MedCLIP-ViT weights",
+    )
     return parser.parse_args()
 
 
@@ -249,7 +289,7 @@ def main() -> None:
     frame = load_pairs(args.predictions_csv, args.generated_image_dir, args.id_column, args.prompt_column)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_embeddings, text_embeddings = encode_pairs(frame, args.batch_size)
+    image_embeddings, text_embeddings = encode_pairs(frame, args.batch_size, args.medclip_checkpoint_dir)
     similarity_matrix = image_embeddings @ text_embeddings.T
     matched = np.diag(similarity_matrix)
 
@@ -293,6 +333,7 @@ def main() -> None:
         "predictions_csv": str(args.predictions_csv.resolve()),
         "predictions_csv_sha256": sha256(args.predictions_csv),
         "generated_image_dir": str(args.generated_image_dir.resolve()),
+        "medclip_checkpoint_dir": str(args.medclip_checkpoint_dir.resolve()),
         "n_pairs": len(frame),
         "negative_shuffles": args.negative_shuffles,
         "seed": args.seed,
