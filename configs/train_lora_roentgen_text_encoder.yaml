@@ -1,0 +1,62 @@
+# Joint UNet + text-encoder LoRA fine-tuning for IU X-Ray.
+# Intended for a single ~16 GB Colab GPU with frontal-only 512 px images and
+# cleaned prompts that fit the model's 77-token context window.
+
+pretrained_model_name_or_path: "stanfordmimi/RoentGen-v2"
+revision: null
+variant: null
+use_auth_token: null
+cache_dir: null
+
+image_dir: "/content/xray-database/train/images"
+prompt_dir: "/content/xray-database/train/labels"
+output_dir: "/content/drive/MyDrive/Projects/data/xray/train_07"
+
+resolution: 512
+train_batch_size: 1
+gradient_accumulation_steps: 8
+mixed_precision: fp16
+gradient_checkpointing: true
+
+# Use a lower learning rate for the text encoder to reduce language drift.
+unet_learning_rate: 3.0e-5
+text_encoder_learning_rate: 5.0e-6
+scale_lr: false
+lr_scheduler: cosine
+lr_warmup_steps: 200
+max_train_steps: 3000
+num_train_epochs: 100
+max_train_samples: null
+
+unet_lora_rank: 16
+unet_lora_alpha: 16
+lora_dropout: 0.0
+train_text_encoder_lora: true
+text_encoder_lora_rank: 4
+text_encoder_lora_alpha: 4
+text_encoder_lora_dropout: 0.0
+
+image_transform: center_crop
+val_split: 0.05
+validation_steps: 250
+metrics_file: metrics.json
+
+seed: 873
+dataloader_num_workers: 2
+use_8bit_adam: false
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1.0e-2
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+allow_tf32: false
+enable_xformers_memory_efficient_attention: true
+prediction_type: null
+noise_offset: 0.0
+
+logging_dir: "logs"
+report_to: wandb
+checkpointing_steps: 500
+checkpoints_total_limit: 5
+resume_from_checkpoint: "latest"
+local_rank: -1

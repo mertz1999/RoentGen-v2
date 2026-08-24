@@ -29,7 +29,7 @@ max_train_samples: null
 lora_rank: 16                      # more capacity than the old rank 8
 lora_alpha: 16
 lora_dropout: 0.0
-train_text_encoder_lora: false     # leave false until text-encoder LoRA is implemented
+train_text_encoder_lora: false     # use the separate text_encoder config for joint training
 
 # --- preprocessing / evaluation / metrics (new) ---
 image_transform: center_crop       # center_crop (no black bars) | pad (old behaviour)

@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -26,72 +25,17 @@ from torch.utils.data import Dataset
 from torchvision.transforms import CenterCrop, Compose, InterpolationMode, Normalize, Resize, ToTensor
 from tqdm.auto import tqdm
 
+if __package__:
+    from .lora_config import LoRATrainConfig, load_config
+else:
+    from lora_config import LoRATrainConfig, load_config
+
 check_min_version("0.35.0")
 
 if is_wandb_available():
     import wandb  # noqa: F401
 
 logger = get_logger(__name__, log_level="INFO")
-
-
-@dataclass
-class LoRATrainConfig:
-    pretrained_model_name_or_path: str = "stanfordmimi/RoentGen-v2"
-    revision: str = None
-    variant: str = None
-    use_auth_token: str = None
-    cache_dir: str = None
-
-    image_dir: str = "/content/temp_dataset_for_zip/images_512x512"
-    prompt_dir: str = "/content/temp_dataset_for_zip/reports"
-    output_dir: str = "/content/drive/MyDrive/Projects/data/xray/train_01"
-
-    resolution: int = 512
-    train_batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    mixed_precision: str = "fp16"
-    gradient_checkpointing: bool = True
-    learning_rate: float = 1.0e-4
-    scale_lr: bool = False
-    lr_scheduler: str = "cosine"
-    lr_warmup_steps: int = 100
-    max_train_steps: int = 1000
-    num_train_epochs: int = 100
-    max_train_samples: int = None
-
-    lora_rank: int = 8
-    lora_alpha: int = 8
-    lora_dropout: float = 0.0
-    train_text_encoder_lora: bool = False
-
-    seed: int = 873
-    dataloader_num_workers: int = 0
-    use_8bit_adam: bool = False
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_weight_decay: float = 1.0e-2
-    adam_epsilon: float = 1.0e-8
-    max_grad_norm: float = 1.0
-    allow_tf32: bool = False
-    enable_xformers_memory_efficient_attention: bool = True
-    prediction_type: str = None
-    noise_offset: float = 0.0
-
-    # --- preprocessing / evaluation / metrics additions ---
-    image_transform: str = "center_crop"   # "center_crop" (recommended) or "pad" (old black-letterbox)
-    val_split: float = 0.0                  # fraction of pairs held out for validation loss (0 disables)
-    validation_steps: int = 0               # compute + log validation loss every N steps (0 disables)
-    metrics_file: str = "metrics.json"      # loss / validation curve data written here (under output_dir)
-
-    logging_dir: str = "logs"
-    report_to: str = "wandb"
-    checkpointing_steps: int = 100
-    checkpoints_total_limit: int = 5
-    resume_from_checkpoint: str = "latest"
-    local_rank: int = -1
-
-    def get_config(self):
-        return self.__dict__
 
 
 class SquarePad:
@@ -198,12 +142,6 @@ class ImagePromptDirectoryDataset(Dataset):
         }
 
 
-def load_config(config_file):
-    with open(config_file, "r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream) or {}
-    return LoRATrainConfig(**config)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for RoentGen-v2.")
     parser.add_argument("--config_file", type=str, required=True, help="Path to the YAML config file.")
@@ -244,12 +182,21 @@ def prune_old_checkpoints(output_dir, checkpoints_total_limit):
         shutil.rmtree(os.path.join(output_dir, checkpoint))
 
 
-def save_lora_weights(accelerator, unet, save_directory):
+def save_lora_weights(accelerator, unet, save_directory, text_encoder=None):
     unwrapped_unet = unwrap_model(accelerator, unet)
     unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
+
+    text_encoder_lora_state_dict = None
+    if text_encoder is not None:
+        unwrapped_text_encoder = unwrap_model(accelerator, text_encoder)
+        text_encoder_lora_state_dict = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unwrapped_text_encoder)
+        )
+
     StableDiffusionPipeline.save_lora_weights(
         save_directory=save_directory,
         unet_lora_layers=unet_lora_state_dict,
+        text_encoder_lora_layers=text_encoder_lora_state_dict,
         safe_serialization=True,
     )
 
@@ -273,10 +220,12 @@ class MetricsLogger:
             "val": {"step": [], "loss": []},
         }
 
-    def log_train(self, step, loss, lr):
+    def log_train(self, step, loss, lr, text_encoder_lr=None):
         self.data["train"]["step"].append(int(step))
         self.data["train"]["loss"].append(float(loss))
         self.data["train"]["lr"].append(float(lr))
+        if text_encoder_lr is not None:
+            self.data["train"].setdefault("text_encoder_lr", []).append(float(text_encoder_lr))
 
     def log_val(self, step, loss):
         self.data["val"]["step"].append(int(step))
@@ -297,8 +246,10 @@ def compute_validation_loss(
     Uses a fixed-seed generator for the noise and timesteps so the value is
     comparable across steps (a true 'is the loss going down' signal, not noise).
     """
-    was_training = unet.training
+    unet_was_training = unet.training
+    text_encoder_was_training = text_encoder.training
     unet.eval()
+    text_encoder.eval()
     device = accelerator.device
     generator = torch.Generator(device=device).manual_seed(seed)
     losses = []
@@ -329,15 +280,14 @@ def compute_validation_loss(
         gathered = accelerator.gather(loss.repeat(pixel_values.shape[0]))
         losses.append(gathered.mean().item())
 
-    if was_training:
+    if unet_was_training:
         unet.train()
+    if text_encoder_was_training:
+        text_encoder.train()
     return sum(losses) / max(len(losses), 1)
 
 
 def main(args):
-    if args.train_text_encoder_lora:
-        raise NotImplementedError("Text-encoder LoRA is not implemented yet. Use train_text_encoder_lora: false.")
-
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
@@ -399,16 +349,27 @@ def main(args):
     text_encoder.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
+        r=args.unet_lora_rank,
+        lora_alpha=args.unet_lora_alpha,
         lora_dropout=args.lora_dropout,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     unet.add_adapter(unet_lora_config)
 
+    if args.train_text_encoder_lora:
+        text_encoder_lora_config = LoraConfig(
+            r=args.text_encoder_lora_rank,
+            lora_alpha=args.text_encoder_lora_alpha,
+            lora_dropout=args.text_encoder_lora_dropout,
+            init_lora_weights="gaussian",
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+        text_encoder.add_adapter(text_encoder_lora_config)
+
     if args.mixed_precision == "fp16":
-        cast_training_params(unet, dtype=torch.float32)
+        models_to_cast = [unet, text_encoder] if args.train_text_encoder_lora else [unet]
+        cast_training_params(models_to_cast, dtype=torch.float32)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -419,19 +380,24 @@ def main(args):
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+        if args.train_text_encoder_lora:
+            text_encoder.gradient_checkpointing_enable()
 
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate
-            * args.gradient_accumulation_steps
-            * args.train_batch_size
-            * accelerator.num_processes
-        )
+        lr_scale = args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        args.unet_learning_rate *= lr_scale
+        args.text_encoder_learning_rate *= lr_scale
 
-    lora_layers = [p for p in unet.parameters() if p.requires_grad]
+    unet_lora_layers = [p for p in unet.parameters() if p.requires_grad]
+    text_encoder_lora_layers = (
+        [p for p in text_encoder.parameters() if p.requires_grad]
+        if args.train_text_encoder_lora
+        else []
+    )
+    lora_layers = unet_lora_layers + text_encoder_lora_layers
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
@@ -441,9 +407,15 @@ def main(args):
     else:
         optimizer_cls = torch.optim.AdamW
 
+    optimizer_parameters = [{"params": unet_lora_layers, "lr": args.unet_learning_rate}]
+    if args.train_text_encoder_lora:
+        optimizer_parameters.append(
+            {"params": text_encoder_lora_layers, "lr": args.text_encoder_learning_rate}
+        )
+
     optimizer = optimizer_cls(
-        lora_layers,
-        lr=args.learning_rate,
+        optimizer_parameters,
+        lr=args.unet_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
@@ -502,11 +474,17 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    if args.train_text_encoder_lora:
+        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if not args.train_text_encoder_lora:
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -517,10 +495,20 @@ def main(args):
     metrics = MetricsLogger(
         os.path.join(args.output_dir, args.metrics_file),
         meta={
-            "learning_rate": args.learning_rate,
+            "unet_learning_rate": args.unet_learning_rate,
+            "text_encoder_learning_rate": (
+                args.text_encoder_learning_rate if args.train_text_encoder_lora else None
+            ),
             "lr_scheduler": args.lr_scheduler,
-            "lora_rank": args.lora_rank,
-            "lora_alpha": args.lora_alpha,
+            "unet_lora_rank": args.unet_lora_rank,
+            "unet_lora_alpha": args.unet_lora_alpha,
+            "text_encoder_lora_rank": (
+                args.text_encoder_lora_rank if args.train_text_encoder_lora else None
+            ),
+            "text_encoder_lora_alpha": (
+                args.text_encoder_lora_alpha if args.train_text_encoder_lora else None
+            ),
+            "train_text_encoder_lora": args.train_text_encoder_lora,
             "train_batch_size": args.train_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "max_train_steps": args.max_train_steps,
@@ -563,10 +551,15 @@ def main(args):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
+        if args.train_text_encoder_lora:
+            text_encoder.train()
         train_loss = 0.0
 
         for batch in train_dataloader:
-            with accelerator.accumulate(unet):
+            models_to_accumulate = (
+                [unet, text_encoder] if args.train_text_encoder_lora else [unet]
+            )
+            with accelerator.accumulate(*models_to_accumulate):
                 pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
                 input_ids = batch["input_ids"].to(accelerator.device)
 
@@ -574,7 +567,11 @@ def main(args):
                     latents = vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * vae.config.scaling_factor
 
+                if args.train_text_encoder_lora:
                     encoder_hidden_states = text_encoder(input_ids, return_dict=False)[0]
+                else:
+                    with torch.no_grad():
+                        encoder_hidden_states = text_encoder(input_ids, return_dict=False)[0]
 
                 noise = torch.randn_like(latents)
                 if args.noise_offset:
@@ -619,10 +616,17 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                current_lr = lr_scheduler.get_last_lr()[0]
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                current_lrs = lr_scheduler.get_last_lr()
+                current_lr = current_lrs[0]
+                current_text_encoder_lr = current_lrs[1] if args.train_text_encoder_lora else None
+                tracker_logs = {"train_loss": train_loss, "unet_lr": current_lr}
+                if current_text_encoder_lr is not None:
+                    tracker_logs["text_encoder_lr"] = current_text_encoder_lr
+                accelerator.log(tracker_logs, step=global_step)
                 if accelerator.is_main_process:
-                    metrics.log_train(global_step, train_loss, current_lr)
+                    metrics.log_train(
+                        global_step, train_loss, current_lr, current_text_encoder_lr
+                    )
                 train_loss = 0.0
 
                 # periodic validation loss (comparable across steps via fixed-seed noise)
@@ -644,11 +648,18 @@ def main(args):
                         prune_old_checkpoints(args.output_dir, args.checkpoints_total_limit)
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        save_lora_weights(accelerator, unet, save_path)
+                        save_lora_weights(
+                            accelerator,
+                            unet,
+                            save_path,
+                            text_encoder if args.train_text_encoder_lora else None,
+                        )
                         metrics.save()
                         logger.info(f"Saved checkpoint to {save_path}")
 
-                logs = {"step_loss": loss.detach().item(), "lr": current_lr}
+                logs = {"step_loss": loss.detach().item(), "unet_lr": current_lr}
+                if current_text_encoder_lr is not None:
+                    logs["text_lr"] = current_text_encoder_lr
                 progress_bar.set_postfix(**logs)
 
                 if global_step >= args.max_train_steps:
@@ -660,7 +671,12 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         final_lora_dir = os.path.join(args.output_dir, "lora")
-        save_lora_weights(accelerator, unet, final_lora_dir)
+        save_lora_weights(
+            accelerator,
+            unet,
+            final_lora_dir,
+            text_encoder if args.train_text_encoder_lora else None,
+        )
         metrics.save()
         logger.info(f"Saved final LoRA weights to {final_lora_dir}")
         logger.info(f"Saved metrics to {metrics.path}")

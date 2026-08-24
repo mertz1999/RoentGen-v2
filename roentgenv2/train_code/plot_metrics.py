@@ -8,7 +8,7 @@ Usage:
 The JSON schema is:
     {
       "meta":  {...hyperparameters...},
-      "train": {"step": [...], "loss": [...], "lr": [...]},
+      "train": {"step": [...], "loss": [...], "lr": [...], "text_encoder_lr": [...]},
       "val":   {"step": [...], "loss": [...]}
     }
 """
@@ -53,6 +53,7 @@ def main():
     train = data.get("train", {})
     val = data.get("val", {})
     tsteps, tloss, tlr = train.get("step", []), train.get("loss", []), train.get("lr", [])
+    text_encoder_lr = train.get("text_encoder_lr", [])
     vsteps, vloss = val.get("step", []), val.get("loss", [])
 
     if not tsteps and not vsteps:
@@ -77,7 +78,16 @@ def main():
 
     if args.show_lr and tlr:
         ax_lr = ax.twinx()
-        ax_lr.plot(tsteps, tlr, color="tab:green", alpha=0.6, linestyle="--", label="learning rate")
+        ax_lr.plot(tsteps, tlr, color="tab:green", alpha=0.6, linestyle="--", label="UNet LR")
+        if len(text_encoder_lr) == len(tsteps):
+            ax_lr.plot(
+                tsteps,
+                text_encoder_lr,
+                color="tab:purple",
+                alpha=0.6,
+                linestyle=":",
+                label="text encoder LR",
+            )
         ax_lr.set_ylabel("learning rate")
         ax_lr.legend(loc="upper right")
 

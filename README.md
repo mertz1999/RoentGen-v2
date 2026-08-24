@@ -131,8 +131,10 @@ train_batch_size: 1
 gradient_accumulation_steps: 4
 mixed_precision: fp16
 gradient_checkpointing: true
-lora_rank: 8
-lora_alpha: 8
+unet_lora_rank: 8
+unet_lora_alpha: 8
+unet_learning_rate: 1.0e-4
+train_text_encoder_lora: false
 resume_from_checkpoint: "latest"
 ```
 
@@ -140,6 +142,22 @@ resume_from_checkpoint: "latest"
 > `configs/train_lora_roentgen_recommended.yaml`. It trains longer
 > (`max_train_steps: 6000`), uses a larger effective batch and LoRA rank,
 > enables the validation curve, and uses the `center_crop` preprocessing (below).
+
+To train both LoRA adapters, use
+`configs/train_lora_roentgen_text_encoder.yaml`. It keeps separate capacity and
+learning rates for the UNet and CLIP text encoder:
+
+```yaml
+unet_lora_rank: 16
+text_encoder_lora_rank: 4
+unet_learning_rate: 3.0e-5
+text_encoder_learning_rate: 5.0e-6
+train_text_encoder_lora: true
+```
+
+The lower text-encoder learning rate reduces the risk of damaging the pretrained
+language representation. Joint training uses more VRAM than UNet-only LoRA;
+keep `train_batch_size: 1` and gradient checkpointing enabled on a 16 GB GPU.
 
 **Image preprocessing (`image_transform`).** Chest X-rays are non-square, so they
 must be made square before training. Two modes are available:
@@ -160,6 +178,22 @@ accelerate launch roentgenv2/train_code/train_lora.py \
   --config_file configs/train_lora_roentgen.yaml
 ```
 
+For the joint UNet + text-encoder run (`train_07`), use:
+
+```bash
+accelerate launch \
+  --num_processes 1 \
+  --num_machines 1 \
+  --mixed_precision fp16 \
+  --dynamo_backend no \
+  roentgenv2/train_code/train_lora.py \
+  --config_file configs/train_lora_roentgen_text_encoder.yaml
+```
+
+Passing the Accelerate values explicitly avoids its "defaults used" warning.
+The Pydantic `repr`/`frozen` messages emitted by some Colab dependency versions
+are warnings and do not stop training.
+
 The script saves checkpoints in:
 
 ```text
@@ -179,6 +213,11 @@ Final LoRA weights are saved to:
 ```text
 /content/drive/MyDrive/Projects/data/xray/train_01/lora
 ```
+
+For joint training, the single LoRA weights file in the `lora` directory
+contains both UNet and text-encoder adapters. Each `checkpoint-*` directory also
+contains both adapters, while `resume_from_checkpoint: "latest"` restores both
+models and the optimizer/scheduler state.
 
 #### 6. Use the fine-tuned LoRA for inference
 
@@ -205,8 +244,8 @@ every validation, and at the end):
 
 ```json
 {
-  "meta":  { "lora_rank": 16, "learning_rate": 0.0001, "image_transform": "center_crop" },
-  "train": { "step": [...], "loss": [...], "lr": [...] },
+  "meta":  { "unet_lora_rank": 16, "unet_learning_rate": 0.00003, "image_transform": "center_crop" },
+  "train": { "step": [...], "loss": [...], "lr": [...], "text_encoder_lr": [...] },
   "val":   { "step": [...], "loss": [...] }
 }
 ```
