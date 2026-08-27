@@ -1,5 +1,4 @@
 import argparse
-import json
 import logging
 import math
 import os
@@ -27,8 +26,10 @@ from tqdm.auto import tqdm
 
 if __package__:
     from .lora_config import LoRATrainConfig, load_config
+    from .metrics_logger import MetricsLogger
 else:
     from lora_config import LoRATrainConfig, load_config
+    from metrics_logger import MetricsLogger
 
 check_min_version("0.35.0")
 
@@ -199,42 +200,6 @@ def save_lora_weights(accelerator, unet, save_directory, text_encoder=None):
         text_encoder_lora_layers=text_encoder_lora_state_dict,
         safe_serialization=True,
     )
-
-
-class MetricsLogger:
-    """Accumulates loss / validation curve data and writes it to a JSON file.
-
-    Schema (consumed by plot_metrics.py):
-        {
-          "meta":  {...run hyperparameters...},
-          "train": {"step": [...], "loss": [...], "lr": [...]},
-          "val":   {"step": [...], "loss": [...]}
-        }
-    """
-
-    def __init__(self, path, meta=None):
-        self.path = path
-        self.data = {
-            "meta": meta or {},
-            "train": {"step": [], "loss": [], "lr": []},
-            "val": {"step": [], "loss": []},
-        }
-
-    def log_train(self, step, loss, lr, text_encoder_lr=None):
-        self.data["train"]["step"].append(int(step))
-        self.data["train"]["loss"].append(float(loss))
-        self.data["train"]["lr"].append(float(lr))
-        if text_encoder_lr is not None:
-            self.data["train"].setdefault("text_encoder_lr", []).append(float(text_encoder_lr))
-
-    def log_val(self, step, loss):
-        self.data["val"]["step"].append(int(step))
-        self.data["val"]["loss"].append(float(loss))
-
-    def save(self):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=2)
 
 
 @torch.no_grad()
@@ -532,6 +497,17 @@ def main(args):
             accelerator.load_state(os.path.join(args.output_dir, checkpoint_path))
             global_step = int(checkpoint_path.split("-")[1])
             first_epoch = global_step // num_update_steps_per_epoch
+            if accelerator.is_main_process:
+                if metrics.load_for_resume(global_step):
+                    logger.info(
+                        f"Loaded metrics history through checkpoint step {global_step} "
+                        f"from {metrics.path}"
+                    )
+                else:
+                    logger.warning(
+                        f"No existing metrics file found at {metrics.path}; "
+                        "resumed training will record metrics from the checkpoint onward."
+                    )
 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     logger.info("***** Running LoRA training *****")
