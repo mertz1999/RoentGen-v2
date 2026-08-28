@@ -68,7 +68,12 @@ def image_index(directory: Path) -> dict[str, Path]:
     return index
 
 
-def load_pairs(csv_path: Path, generated_dir: Path, id_column: str, prompt_column: str) -> pd.DataFrame:
+def load_csv_pairs(
+    csv_path: Path,
+    generated_dir: Path,
+    id_column: str,
+    prompt_column: str,
+) -> pd.DataFrame:
     if not csv_path.is_file():
         raise FileNotFoundError(f"Predictions CSV does not exist: {csv_path}")
     frame = pd.read_csv(csv_path)
@@ -93,6 +98,56 @@ def load_pairs(csv_path: Path, generated_dir: Path, id_column: str, prompt_colum
     if missing_images:
         raise ValueError(f"No generated image matches these CSV IDs: {missing_images}")
     return frame.reset_index(drop=True)
+
+
+def load_prompt_dir_pairs(prompt_dir: Path, generated_dir: Path) -> pd.DataFrame:
+    """Pair ``<id>.txt`` prompts with ``<id>`` or ``<id>_0`` generated images."""
+
+    if not prompt_dir.is_dir():
+        raise FileNotFoundError(f"Prompt directory does not exist: {prompt_dir}")
+    prompt_paths = sorted(
+        path for path in prompt_dir.iterdir() if path.is_file() and path.suffix.lower() == ".txt"
+    )
+    if not prompt_paths:
+        raise ValueError(f"No TXT prompt files found in {prompt_dir}")
+
+    images = image_index(generated_dir)
+    rows = []
+    missing_images = []
+    for prompt_path in prompt_paths:
+        stem = prompt_path.stem
+        candidates = [
+            image_path
+            for image_stem in (stem, f"{stem}_0")
+            if (image_path := images.get(image_stem)) is not None
+        ]
+        if not candidates:
+            missing_images.append(stem)
+            continue
+        if len(candidates) > 1:
+            candidate_names = ", ".join(path.name for path in candidates)
+            raise ValueError(
+                f"Multiple generated images match prompt {prompt_path.name}: {candidate_names}"
+            )
+
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if not prompt:
+            raise ValueError(f"Prompt file is blank: {prompt_path}")
+        rows.append(
+            {
+                "folder_stem": stem,
+                "prompt_path": prompt_path,
+                "prompt": prompt,
+                "image_path": candidates[0],
+            }
+        )
+
+    if missing_images:
+        raise ValueError(
+            "No generated image matches these prompt files: "
+            f"{missing_images[:10]}"
+        )
+    return pd.DataFrame(rows)
 
 
 def derangement(size: int, rng: np.random.Generator) -> np.ndarray:
@@ -263,7 +318,19 @@ def plot_distributions(matched: np.ndarray, negatives: np.ndarray, path: Path) -
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--predictions-csv", type=Path, required=True)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--predictions-csv",
+        type=Path,
+        help="CSV containing image IDs and prompts",
+    )
+    input_group.add_argument(
+        "--prompt-dir",
+        "--label-dir",
+        dest="prompt_dir",
+        type=Path,
+        help="Directory of <image-id>.txt prompts; accepts <image-id> or <image-id>_0 images",
+    )
     parser.add_argument("--generated-image-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--id-column", default="folder_stem", help="CSV column matching generated image stems")
@@ -286,7 +353,24 @@ def main() -> None:
     args = parse_args()
     if args.batch_size < 1 or args.negative_shuffles < 1:
         raise ValueError("--batch-size and --negative-shuffles must be positive")
-    frame = load_pairs(args.predictions_csv, args.generated_image_dir, args.id_column, args.prompt_column)
+    if args.predictions_csv is not None:
+        frame = load_csv_pairs(
+            args.predictions_csv,
+            args.generated_image_dir,
+            args.id_column,
+            args.prompt_column,
+        )
+        input_summary = {
+            "type": "predictions_csv",
+            "path": str(args.predictions_csv.resolve()),
+            "sha256": sha256(args.predictions_csv),
+        }
+    else:
+        frame = load_prompt_dir_pairs(args.prompt_dir, args.generated_image_dir)
+        input_summary = {
+            "type": "prompt_directory",
+            "path": str(args.prompt_dir.resolve()),
+        }
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     image_embeddings, text_embeddings = encode_pairs(frame, args.batch_size, args.medclip_checkpoint_dir)
@@ -319,7 +403,7 @@ def main() -> None:
     for index in range(args.negative_shuffles):
         output[f"negative_similarity_{index + 1}"] = negative_scores[:, index]
     keep_columns = [
-        column for column in ["report_id", "folder_stem", "image_path", "prompt", "matched_similarity", "negative_report_id", "negative_folder_stem", "negative_similarity_mean", "paired_difference"]
+        column for column in ["report_id", "folder_stem", "image_path", "prompt_path", "prompt", "matched_similarity", "negative_report_id", "negative_folder_stem", "negative_similarity_mean", "paired_difference"]
         if column in output.columns
     ] + [f"negative_similarity_{index + 1}" for index in range(args.negative_shuffles)]
     output[keep_columns].to_csv(args.output_dir / "alignment_per_pair.csv", index=False)
@@ -330,8 +414,7 @@ def main() -> None:
         "metric": "MedCLIP cosine similarity between normalized embeddings",
         "model": "MedCLIP-ViT",
         "medclip_git_revision": MEDCLIP_REVISION,
-        "predictions_csv": str(args.predictions_csv.resolve()),
-        "predictions_csv_sha256": sha256(args.predictions_csv),
+        "input_source": input_summary,
         "generated_image_dir": str(args.generated_image_dir.resolve()),
         "medclip_checkpoint_dir": str(args.medclip_checkpoint_dir.resolve()),
         "n_pairs": len(frame),
@@ -379,6 +462,11 @@ def main() -> None:
             "This script does not construct the separate hard-negative experiment required for a fuller study.",
         ],
     }
+    if args.predictions_csv is not None:
+        summary["predictions_csv"] = input_summary["path"]
+        summary["predictions_csv_sha256"] = input_summary["sha256"]
+    else:
+        summary["prompt_dir"] = input_summary["path"]
     (args.output_dir / "alignment_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

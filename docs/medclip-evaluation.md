@@ -13,6 +13,23 @@ runtime.
 
 ## Inputs
 
+The evaluator accepts either a directory of text prompts or the original
+predictions CSV. For direct image/label-folder evaluation, use:
+
+```text
+/content/xray-database/test/labels/
+  3.txt, 7.txt, ...
+
+/content/results/predicted/
+  3.png, 7.png, ...
+```
+
+Images written by this repository's inference script as `3_0.jpg`, `7_0.jpg`,
+and so on are also matched automatically to `3.txt`, `7.txt`. If both `3.jpg`
+and `3_0.jpg` exist, remove the unintended file so the pair is unambiguous.
+
+The original CSV mode remains available:
+
 ```text
 /content/test_predictions.csv
   required columns: folder_stem, prediction
@@ -21,9 +38,9 @@ runtime.
   3.png, 7.png, ... matching each folder_stem
 ```
 
-The generated image directory must contain exactly one image for every CSV row.
-The script stops on duplicate IDs, missing images, blank prompts, or bad CSV
-column names instead of producing a partial score.
+The generated image directory must contain one matching image for every prompt
+file or CSV row. The script stops on duplicate or ambiguous IDs, missing images,
+blank prompts, or bad CSV column names instead of producing a partial score.
 
 ## Fresh Colab runtime
 
@@ -33,7 +50,19 @@ cd RoentGen-v2
 bash scripts/install_medclip_colab.sh
 ```
 
-Mount Drive and set the paths below to the saved files from the RoentGen run:
+For `/content/results/predicted` images and the test label folder, run:
+
+```bash
+python roentgenv2/evaluation/medclip_alignment.py \
+  --prompt-dir /content/xray-database/test/labels \
+  --generated-image-dir /content/results/predicted \
+  --output-dir /content/medclip_evaluation \
+  --batch-size 8 \
+  --negative-shuffles 5 \
+  --seed 873
+```
+
+To evaluate prompts stored in the predictions CSV instead, run:
 
 ```bash
 python roentgenv2/evaluation/medclip_alignment.py \
