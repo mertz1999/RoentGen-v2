@@ -6,9 +6,8 @@ from pathlib import Path
 import numpy as np
 
 from roentgenv2.evaluation.medclip_alignment import (
-    binary_roc_auc,
-    derangement,
     load_prompt_dir_pairs,
+    paired_similarities,
     preprocess_medclip_image,
     stem_from_value,
 )
@@ -20,12 +19,22 @@ class MedclipAlignmentTests(unittest.TestCase):
         self.assertEqual(stem_from_value(1002.0), "1002")
         self.assertEqual(stem_from_value("CXR1002"), "CXR1002")
 
-    def test_negative_mapping_has_no_matched_pairs(self):
-        negative = derangement(100, np.random.default_rng(873))
-        self.assertFalse(np.any(negative == np.arange(100)))
+    def test_paired_similarities_return_raw_cosine_and_scaled_logits(self):
+        image_embeddings = np.array([[1.0, 0.0], [0.0, 1.0]])
+        text_embeddings = np.array([[0.6, 0.8], [0.8, 0.6]])
 
-    def test_auc_is_one_when_every_matched_score_is_higher(self):
-        self.assertEqual(binary_roc_auc(np.array([0.9, 0.8]), np.array([0.1, 0.2, 0.3])), 1.0)
+        raw_cosine, scaled_logits = paired_similarities(
+            image_embeddings,
+            text_embeddings,
+            logit_scale=10.0,
+        )
+
+        np.testing.assert_allclose(raw_cosine, [0.6, 0.6])
+        np.testing.assert_allclose(scaled_logits, [6.0, 6.0])
+
+    def test_paired_similarities_reject_mismatched_embedding_shapes(self):
+        with self.assertRaisesRegex(ValueError, "must have the same shape"):
+            paired_similarities(np.zeros((2, 3)), np.zeros((1, 3)), 10.0)
 
     def test_prompt_directory_matches_exact_and_inference_image_names(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

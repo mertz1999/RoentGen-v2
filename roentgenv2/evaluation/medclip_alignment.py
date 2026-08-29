@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Evaluate generated chest X-ray / prompt alignment with MedCLIP.
+"""Measure matched image/prompt similarity with MedCLIP.
 
 Run this only in the separate MedCLIP environment described in
-``docs/medclip-evaluation.md``. It uses each generated image's matching prompt
-and multiple independently shuffled prompts as controlled random negatives.
+``docs/medclip-evaluation.md``. Each image is scored only against its matching
+prompt; this evaluator does not construct or score negative pairs.
 """
 
 from __future__ import annotations
@@ -150,21 +150,6 @@ def load_prompt_dir_pairs(prompt_dir: Path, generated_dir: Path) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def derangement(size: int, rng: np.random.Generator) -> np.ndarray:
-    """Return a shuffled index vector with no position paired to itself."""
-    if size < 2:
-        raise ValueError("Need at least two pairs to create negative prompt pairs")
-    original = np.arange(size)
-    candidate = rng.permutation(size)
-    for _ in range(100):
-        if not np.any(candidate == original):
-            return candidate
-        candidate = rng.permutation(size)
-    # Deterministic no-fixed-point fallback; still based on the declared seed.
-    shift = int(rng.integers(1, size))
-    return np.roll(original, shift)
-
-
 def bootstrap_mean_ci(values: np.ndarray, rng: np.random.Generator, samples: int) -> tuple[float, float]:
     means = np.empty(samples, dtype=np.float64)
     count = len(values)
@@ -173,30 +158,20 @@ def bootstrap_mean_ci(values: np.ndarray, rng: np.random.Generator, samples: int
     return tuple(float(value) for value in np.quantile(means, [0.025, 0.975]))
 
 
-def sign_flip_pvalue(differences: np.ndarray, rng: np.random.Generator, samples: int) -> float:
-    """One-sided paired randomization test for matched similarity > negative."""
-    observed = float(differences.mean())
-    if observed <= 0:
-        return 1.0
-    count = 0
-    completed = 0
-    chunk_size = min(1000, samples)
-    while completed < samples:
-        current = min(chunk_size, samples - completed)
-        signs = rng.choice(np.array([-1.0, 1.0]), size=(current, len(differences)))
-        null_means = (signs * differences).mean(axis=1)
-        count += int(np.count_nonzero(null_means >= observed))
-        completed += current
-    return float((count + 1) / (samples + 1))
+def paired_similarities(
+    image_embeddings: np.ndarray,
+    text_embeddings: np.ndarray,
+    logit_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return raw cosine and official temperature-scaled logits per pair."""
 
-
-def binary_roc_auc(positive_scores: np.ndarray, negative_scores: np.ndarray) -> float:
-    """AUC as the probability that a positive score exceeds a negative score."""
-    wins = 0.0
-    for score in positive_scores:
-        wins += float(np.count_nonzero(score > negative_scores))
-        wins += 0.5 * float(np.count_nonzero(score == negative_scores))
-    return wins / (len(positive_scores) * len(negative_scores))
+    if image_embeddings.shape != text_embeddings.shape:
+        raise ValueError(
+            "Image and text embedding arrays must have the same shape; "
+            f"got {image_embeddings.shape} and {text_embeddings.shape}."
+        )
+    raw_cosine = np.sum(image_embeddings * text_embeddings, axis=1)
+    return raw_cosine, raw_cosine * float(logit_scale)
 
 
 def preprocess_medclip_image(image: "Image.Image") -> np.ndarray:
@@ -252,7 +227,11 @@ def load_medclip_vit_weights(model: object, checkpoint_dir: Path) -> None:
         print("Loaded MedCLIP-ViT with the legacy position_ids buffer safely ignored.")
 
 
-def encode_pairs(frame: pd.DataFrame, batch_size: int, checkpoint_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+def encode_pairs(
+    frame: pd.DataFrame,
+    batch_size: int,
+    checkpoint_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, float]:
     import torch
     from PIL import Image
 
@@ -270,6 +249,7 @@ def encode_pairs(frame: pd.DataFrame, batch_size: int, checkpoint_dir: Path) -> 
     model = MedCLIPModel(vision_cls=MedCLIPVisionModelViT)
     load_medclip_vit_weights(model, checkpoint_dir)
     model.cuda().eval()
+    logit_scale = float(model.logit_scale.detach().clamp(0, 4.6052).exp().cpu().item())
 
     image_embeddings: list[np.ndarray] = []
     text_embeddings: list[np.ndarray] = []
@@ -294,26 +274,51 @@ def encode_pairs(frame: pd.DataFrame, batch_size: int, checkpoint_dir: Path) -> 
             )
             image_embeddings.append(outputs["img_embeds"].detach().cpu().numpy())
             text_embeddings.append(outputs["text_embeds"].detach().cpu().numpy())
-    return np.concatenate(image_embeddings), np.concatenate(text_embeddings)
+    return np.concatenate(image_embeddings), np.concatenate(text_embeddings), logit_scale
 
 
-def plot_distributions(matched: np.ndarray, negatives: np.ndarray, path: Path) -> None:
+def plot_similarity_distributions(
+    raw_cosine: np.ndarray,
+    scaled_logits: np.ndarray,
+    path: Path,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axis = plt.subplots(figsize=(9, 5))
-    axis.hist(matched, bins=30, density=True, alpha=0.65, label="matched image-text pairs")
-    axis.hist(negatives, bins=30, density=True, alpha=0.65, label="shuffled negative pairs")
-    axis.set_xlabel("MedCLIP cosine similarity")
-    axis.set_ylabel("density")
-    axis.set_title("MedCLIP image-text alignment")
-    axis.grid(alpha=0.25)
-    axis.legend()
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    axes[0].hist(raw_cosine, bins=30, alpha=0.75, color="tab:blue")
+    axes[0].axvline(raw_cosine.mean(), color="black", linestyle="--", label="mean")
+    axes[0].set_xlabel("raw cosine similarity")
+    axes[0].set_ylabel("number of matched pairs")
+    axes[0].set_title("Matched-pair cosine")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend()
+
+    axes[1].hist(scaled_logits, bins=30, alpha=0.75, color="tab:green")
+    axes[1].axvline(scaled_logits.mean(), color="black", linestyle="--", label="mean")
+    axes[1].set_xlabel("temperature-scaled MedCLIP logit")
+    axes[1].set_ylabel("number of matched pairs")
+    axes[1].set_title("Matched-pair scaled logit")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend()
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def similarity_summary(values: np.ndarray, mean_ci: tuple[float, float]) -> dict[str, object]:
+    return {
+        "mean": float(values.mean()),
+        "std": float(values.std(ddof=1 if len(values) > 1 else 0)),
+        "median": float(np.median(values)),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "p05": float(np.quantile(values, 0.05)),
+        "p95": float(np.quantile(values, 0.95)),
+        "mean_95_bootstrap_ci": list(mean_ci),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -336,9 +341,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--id-column", default="folder_stem", help="CSV column matching generated image stems")
     parser.add_argument("--prompt-column", default="prediction", help="CSV text column used to generate images")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--negative-shuffles", type=int, default=5)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
-    parser.add_argument("--permutation-samples", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=873)
     parser.add_argument(
         "--medclip-checkpoint-dir",
@@ -351,8 +354,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size < 1 or args.negative_shuffles < 1:
-        raise ValueError("--batch-size and --negative-shuffles must be positive")
+    if args.batch_size < 1 or args.bootstrap_samples < 1:
+        raise ValueError("--batch-size and --bootstrap-samples must be positive")
     if args.predictions_csv is not None:
         frame = load_csv_pairs(
             args.predictions_csv,
@@ -373,76 +376,60 @@ def main() -> None:
         }
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_embeddings, text_embeddings = encode_pairs(frame, args.batch_size, args.medclip_checkpoint_dir)
-    similarity_matrix = image_embeddings @ text_embeddings.T
-    matched = np.diag(similarity_matrix)
-
-    rng = np.random.default_rng(args.seed)
-    negative_indices = np.stack([derangement(len(frame), rng) for _ in range(args.negative_shuffles)], axis=1)
-    negative_scores = np.column_stack(
-        [similarity_matrix[np.arange(len(frame)), negative_indices[:, index]] for index in range(args.negative_shuffles)]
+    image_embeddings, text_embeddings, logit_scale = encode_pairs(
+        frame,
+        args.batch_size,
+        args.medclip_checkpoint_dir,
     )
-    negative_flat = negative_scores.ravel()
-    negative_mean = negative_scores.mean(axis=1)
-    differences = matched - negative_mean
-
-    ranks = 1 + np.count_nonzero(similarity_matrix > matched[:, None], axis=1)
-    auc = binary_roc_auc(matched, negative_flat)
+    raw_cosine, scaled_logits = paired_similarities(
+        image_embeddings,
+        text_embeddings,
+        logit_scale,
+    )
     ci_rng = np.random.default_rng(args.seed + 1)
-    matched_ci = bootstrap_mean_ci(matched, ci_rng, args.bootstrap_samples)
-    negative_ci = bootstrap_mean_ci(negative_flat, ci_rng, args.bootstrap_samples)
-    difference_ci = bootstrap_mean_ci(differences, ci_rng, args.bootstrap_samples)
-    p_value = sign_flip_pvalue(differences, np.random.default_rng(args.seed + 2), args.permutation_samples)
+    raw_cosine_ci = bootstrap_mean_ci(raw_cosine, ci_rng, args.bootstrap_samples)
+    scaled_logit_ci = tuple(value * logit_scale for value in raw_cosine_ci)
 
     output = frame.copy()
-    output["matched_similarity"] = matched
-    output["negative_similarity_mean"] = negative_mean
-    output["paired_difference"] = differences
-    output["negative_report_id"] = [frame.iloc[index]["report_id"] if "report_id" in frame.columns else "" for index in negative_indices[:, 0]]
-    output["negative_folder_stem"] = [frame.iloc[index]["folder_stem"] for index in negative_indices[:, 0]]
-    for index in range(args.negative_shuffles):
-        output[f"negative_similarity_{index + 1}"] = negative_scores[:, index]
+    output["raw_cosine_similarity"] = raw_cosine
+    output["scaled_medclip_logit"] = scaled_logits
     keep_columns = [
-        column for column in ["report_id", "folder_stem", "image_path", "prompt_path", "prompt", "matched_similarity", "negative_report_id", "negative_folder_stem", "negative_similarity_mean", "paired_difference"]
+        column
+        for column in [
+            "report_id",
+            "folder_stem",
+            "image_path",
+            "prompt_path",
+            "prompt",
+            "raw_cosine_similarity",
+            "scaled_medclip_logit",
+        ]
         if column in output.columns
-    ] + [f"negative_similarity_{index + 1}" for index in range(args.negative_shuffles)]
-    output[keep_columns].to_csv(args.output_dir / "alignment_per_pair.csv", index=False)
-    plot_distributions(matched, negative_flat, args.output_dir / "alignment_distribution.png")
+    ]
+    output[keep_columns].to_csv(args.output_dir / "similarity_per_pair.csv", index=False)
+    plot_similarity_distributions(
+        raw_cosine,
+        scaled_logits,
+        args.output_dir / "similarity_distribution.png",
+    )
 
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "metric": "MedCLIP cosine similarity between normalized embeddings",
+        "metric": "MedCLIP similarity for matched image/prompt pairs only",
         "model": "MedCLIP-ViT",
         "medclip_git_revision": MEDCLIP_REVISION,
         "input_source": input_summary,
         "generated_image_dir": str(args.generated_image_dir.resolve()),
         "medclip_checkpoint_dir": str(args.medclip_checkpoint_dir.resolve()),
         "n_pairs": len(frame),
-        "negative_shuffles": args.negative_shuffles,
         "seed": args.seed,
-        "matched": {
-            "mean": float(matched.mean()),
-            "std": float(matched.std(ddof=1)),
-            "median": float(np.median(matched)),
-            "mean_95_bootstrap_ci": list(matched_ci),
+        "temperature_scaling": {
+            "logit_scale": logit_scale,
+            "formula": "scaled_medclip_logit = raw_cosine_similarity * logit_scale",
+            "note": "The scaled logit is not a probability and does not change pair ranking.",
         },
-        "negative": {
-            "mean": float(negative_flat.mean()),
-            "std": float(negative_flat.std(ddof=1)),
-            "median": float(np.median(negative_flat)),
-            "mean_95_bootstrap_ci": list(negative_ci),
-        },
-        "matched_minus_negative": {
-            "mean": float(differences.mean()),
-            "mean_95_bootstrap_ci": list(difference_ci),
-            "one_sided_sign_flip_p_value": p_value,
-        },
-        "matched_vs_negative_auroc": auc,
-        "retrieval": {
-            "recall_at_1": float(np.mean(ranks <= 1)),
-            "recall_at_5": float(np.mean(ranks <= 5)),
-            "mean_rank": float(ranks.mean()),
-        },
+        "raw_cosine_similarity": similarity_summary(raw_cosine, raw_cosine_ci),
+        "scaled_medclip_logit": similarity_summary(scaled_logits, scaled_logit_ci),
         "software": {
             "torch": package_version("torch"),
             "transformers": package_version("transformers"),
@@ -454,12 +441,13 @@ def main() -> None:
             "text": f"{MEDCLIP_TEXT_MODEL}, max_length=77",
         },
         "files": {
-            "per_pair": "alignment_per_pair.csv",
-            "distribution_figure": "alignment_distribution.png",
+            "per_pair": "similarity_per_pair.csv",
+            "distribution_figure": "similarity_distribution.png",
         },
         "limitations": [
-            "Negatives are random shuffled prompts and may occasionally be semantically similar.",
-            "This script does not construct the separate hard-negative experiment required for a fuller study.",
+            "Only matched image/prompt pairs are scored; no negative comparison is performed.",
+            "Absolute cosine similarity and scaled logits have no universal pass/fail threshold.",
+            "Use the same dataset and settings when comparing real, base-model, and fine-tuned images.",
         ],
     }
     if args.predictions_csv is not None:
@@ -467,7 +455,10 @@ def main() -> None:
         summary["predictions_csv_sha256"] = input_summary["sha256"]
     else:
         summary["prompt_dir"] = input_summary["path"]
-    (args.output_dir / "alignment_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (args.output_dir / "similarity_summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps(summary, indent=2))
 
 

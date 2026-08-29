@@ -1,8 +1,12 @@
-# MedCLIP image-text alignment evaluation
+# MedCLIP matched-pair similarity evaluation
 
 Run this after RoentGen inference has produced one synthetic image for each
-held-out prompt. It measures whether the generated X-ray matches the same
-BioGPT prompt more closely than a shuffled, incorrect prompt.
+held-out prompt. It scores each image only against its matching text label. It
+does not create shuffled negatives, retrieval ranks, AUROC, or p-values.
+
+The output includes both raw cosine similarity and MedCLIP's official
+temperature-scaled logit. The scaled logit is easier to read but is not a
+probability and contains the same ranking information as the raw cosine.
 
 Use a fresh Colab runtime. The official MedCLIP package requires
 `transformers<=4.24.0`, whose required `tokenizers` package has no Python 3.12
@@ -56,9 +60,8 @@ For `/content/results/predicted` images and the test label folder, run:
 python roentgenv2/evaluation/medclip_alignment.py \
   --prompt-dir /content/xray-database/test/labels \
   --generated-image-dir /content/results/predicted \
-  --output-dir /content/medclip_evaluation \
+  --output-dir /content/medclip_similarity \
   --batch-size 8 \
-  --negative-shuffles 5 \
   --seed 873
 ```
 
@@ -68,9 +71,8 @@ To evaluate prompts stored in the predictions CSV instead, run:
 python roentgenv2/evaluation/medclip_alignment.py \
   --predictions-csv /content/test_predictions.csv \
   --generated-image-dir /content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/test_generated \
-  --output-dir /content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/medclip_evaluation \
+  --output-dir /content/drive/MyDrive/Projects/data/xray/roentgen_lora_v1/medclip_similarity \
   --batch-size 8 \
-  --negative-shuffles 5 \
   --seed 873
 ```
 
@@ -87,18 +89,19 @@ git pull origin main
 ## Outputs
 
 ```text
-medclip_evaluation/
-  alignment_per_pair.csv        every matched and negative score
-  alignment_summary.json        means, standard deviations, bootstrap CIs, AUROC, retrieval
-  alignment_distribution.png    matched versus negative score distributions
+medclip_similarity/
+  similarity_per_pair.csv       raw cosine and scaled logit for every matched pair
+  similarity_summary.json       aggregate statistics and the loaded temperature scale
+  similarity_distribution.png  raw-cosine and scaled-logit histograms
 ```
 
-Interpretation:
+Important fields:
 
-- `matched.mean` should be higher than `negative.mean`.
-- The confidence interval for `matched_minus_negative.mean` should be above
-  zero, and the one-sided permutation p-value should be small.
-- `matched_vs_negative_auroc` should be above 0.50; higher is better.
+- `raw_cosine_similarity.mean` is the average cosine for correct image/text pairs.
+- `temperature_scaling.logit_scale` is loaded from the MedCLIP checkpoint.
+- `scaled_medclip_logit.mean` is raw cosine multiplied by that scale.
+- There is no universal good/bad threshold for either value. Compare real,
+  base-model, and fine-tuned outputs using the same labels and settings.
 - Do not combine the raw MedCLIP value with raw FID. FID is a global,
   unbounded distribution score and must be normalized separately for the final
   HybridScore.
