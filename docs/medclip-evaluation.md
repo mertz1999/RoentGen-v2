@@ -1,8 +1,10 @@
-# MedCLIP matched-pair similarity evaluation
+# MedCLIP matched-pair and all-other-label evaluation
 
 Run this after RoentGen inference has produced one synthetic image for each
-held-out prompt. It scores each image only against its matching text label. It
-does not create shuffled negatives, retrieval ranks, AUROC, or p-values.
+held-out prompt. It scores each image against its matching text label and uses
+every other label in the evaluation set as an unpaired diagnostic baseline.
+It does not randomly select a negative label or assume that unpaired labels are
+medically negative.
 
 The output includes both raw cosine similarity and MedCLIP's official
 temperature-scaled logit. The scaled logit is easier to read but is not a
@@ -90,9 +92,9 @@ git pull origin main
 
 ```text
 medclip_similarity/
-  similarity_per_pair.csv       raw cosine and scaled logit for every matched pair
+  similarity_per_pair.csv       matched, unpaired, margin, percentile, and rank per image
   similarity_summary.json       aggregate statistics and the loaded temperature scale
-  similarity_distribution.png  raw-cosine and scaled-logit histograms
+  similarity_distribution.png  matched/unpaired similarity and margin histograms
 ```
 
 Important fields:
@@ -100,8 +102,20 @@ Important fields:
 - `raw_cosine_similarity.mean` is the average cosine for correct image/text pairs.
 - `temperature_scaling.logit_scale` is loaded from the MedCLIP checkpoint.
 - `scaled_medclip_logit.mean` is raw cosine multiplied by that scale.
+- `all_other_labels_diagnostic.mean_unpaired_cosine_similarity.mean` is the
+  average similarity between each image and all labels belonging to other images.
+- `all_other_labels_diagnostic.mean_unpaired_cosine_distance.mean` is one minus
+  the mean unpaired cosine similarity; larger means farther away.
+- `all_other_labels_diagnostic.matched_minus_unpaired_cosine_margin.mean` should
+  be positive when correct labels are better aligned than other labels.
+- `all_other_labels_diagnostic.correct_label_percentile.mean` is easiest to
+  interpret: `100` is best and approximately `50` is chance-level ordering.
+- `all_other_labels_diagnostic.correct_label_rank.mean` uses `1` as the best rank.
 - There is no universal good/bad threshold for either value. Compare real,
   base-model, and fine-tuned outputs using the same labels and settings.
+- Other reports may describe the same findings as the correct report. These
+  semantically similar reports are not true negatives and can reduce the margin,
+  percentile, and rank even when the image/label file pairing is correct.
 - Do not combine the raw MedCLIP value with raw FID. FID is a global,
   unbounded distribution score and must be normalized separately for the final
   HybridScore.

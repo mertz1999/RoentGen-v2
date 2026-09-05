@@ -2,8 +2,9 @@
 """Measure matched image/prompt similarity with MedCLIP.
 
 Run this only in the separate MedCLIP environment described in
-``docs/medclip-evaluation.md``. Each image is scored only against its matching
-prompt; this evaluator does not construct or score negative pairs.
+``docs/medclip-evaluation.md``. Each image is scored against its matching
+prompt and, as a diagnostic baseline, against every other prompt in the same
+evaluation set. Unpaired prompts are not assumed to be medically negative.
 """
 
 from __future__ import annotations
@@ -174,6 +175,60 @@ def paired_similarities(
     return raw_cosine, raw_cosine * float(logit_scale)
 
 
+def all_other_label_diagnostics(
+    image_embeddings: np.ndarray,
+    text_embeddings: np.ndarray,
+    logit_scale: float,
+) -> dict[str, np.ndarray]:
+    """Compare every image with its matched label and all other labels.
+
+    The unpaired value for one image is the mean similarity to every label
+    except its matched label. Percentiles and ranks use midranks so identical
+    labels receive half credit instead of being treated as distinct negatives.
+    """
+
+    if image_embeddings.ndim != 2 or text_embeddings.ndim != 2:
+        raise ValueError(
+            "Image and text embedding arrays must be two-dimensional; "
+            f"got {image_embeddings.ndim} and {text_embeddings.ndim} dimensions."
+        )
+    matched_cosine, matched_scaled_logit = paired_similarities(
+        image_embeddings,
+        text_embeddings,
+        logit_scale,
+    )
+    pair_count = image_embeddings.shape[0]
+    if pair_count < 2:
+        raise ValueError("At least two image/label pairs are required for the all-other-label diagnostic.")
+
+    similarity_matrix = image_embeddings @ text_embeddings.T
+    other_mask = ~np.eye(pair_count, dtype=bool)
+    other_similarities = similarity_matrix[other_mask].reshape(pair_count, pair_count - 1)
+    mean_unpaired_cosine = other_similarities.mean(axis=1)
+    cosine_margin = matched_cosine - mean_unpaired_cosine
+
+    matched_column = matched_cosine[:, None]
+    ties = np.isclose(other_similarities, matched_column, rtol=1e-7, atol=1e-8)
+    lower = (other_similarities < matched_column) & ~ties
+    higher = (other_similarities > matched_column) & ~ties
+    correct_label_percentile = 100.0 * (
+        lower.sum(axis=1) + 0.5 * ties.sum(axis=1)
+    ) / (pair_count - 1)
+    correct_label_rank = 1.0 + higher.sum(axis=1) + 0.5 * ties.sum(axis=1)
+
+    return {
+        "raw_cosine_similarity": matched_cosine,
+        "scaled_medclip_logit": matched_scaled_logit,
+        "mean_unpaired_cosine_similarity": mean_unpaired_cosine,
+        "mean_unpaired_cosine_distance": 1.0 - mean_unpaired_cosine,
+        "matched_minus_unpaired_cosine_margin": cosine_margin,
+        "mean_unpaired_scaled_medclip_logit": mean_unpaired_cosine * float(logit_scale),
+        "matched_minus_unpaired_scaled_logit_margin": cosine_margin * float(logit_scale),
+        "correct_label_percentile": correct_label_percentile,
+        "correct_label_rank": correct_label_rank,
+    }
+
+
 def preprocess_medclip_image(image: "Image.Image") -> np.ndarray:
     """Reproduce MedCLIP's documented grayscale square-pad/224 normalization.
 
@@ -277,9 +332,10 @@ def encode_pairs(
     return np.concatenate(image_embeddings), np.concatenate(text_embeddings), logit_scale
 
 
-def plot_similarity_distributions(
-    raw_cosine: np.ndarray,
-    scaled_logits: np.ndarray,
+def plot_similarity_diagnostics(
+    matched_cosine: np.ndarray,
+    mean_unpaired_cosine: np.ndarray,
+    cosine_margin: np.ndarray,
     path: Path,
 ) -> None:
     import matplotlib
@@ -288,19 +344,26 @@ def plot_similarity_distributions(
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].hist(raw_cosine, bins=30, alpha=0.75, color="tab:blue")
-    axes[0].axvline(raw_cosine.mean(), color="black", linestyle="--", label="mean")
+    axes[0].hist(matched_cosine, bins=30, alpha=0.65, color="tab:blue", label="matched label")
+    axes[0].hist(
+        mean_unpaired_cosine,
+        bins=30,
+        alpha=0.65,
+        color="tab:orange",
+        label="mean of all other labels",
+    )
     axes[0].set_xlabel("raw cosine similarity")
-    axes[0].set_ylabel("number of matched pairs")
-    axes[0].set_title("Matched-pair cosine")
+    axes[0].set_ylabel("number of images")
+    axes[0].set_title("Matched vs all-other-label similarity")
     axes[0].grid(alpha=0.25)
     axes[0].legend()
 
-    axes[1].hist(scaled_logits, bins=30, alpha=0.75, color="tab:green")
-    axes[1].axvline(scaled_logits.mean(), color="black", linestyle="--", label="mean")
-    axes[1].set_xlabel("temperature-scaled MedCLIP logit")
-    axes[1].set_ylabel("number of matched pairs")
-    axes[1].set_title("Matched-pair scaled logit")
+    axes[1].hist(cosine_margin, bins=30, alpha=0.75, color="tab:green")
+    axes[1].axvline(0.0, color="black", linestyle="--", label="no separation")
+    axes[1].axvline(cosine_margin.mean(), color="tab:red", linestyle="--", label="mean margin")
+    axes[1].set_xlabel("matched minus mean-unpaired cosine")
+    axes[1].set_ylabel("number of images")
+    axes[1].set_title("Correct-label separation")
     axes[1].grid(alpha=0.25)
     axes[1].legend()
     fig.tight_layout()
@@ -381,18 +444,48 @@ def main() -> None:
         args.batch_size,
         args.medclip_checkpoint_dir,
     )
-    raw_cosine, scaled_logits = paired_similarities(
+    diagnostics = all_other_label_diagnostics(
         image_embeddings,
         text_embeddings,
         logit_scale,
     )
+    raw_cosine = diagnostics["raw_cosine_similarity"]
+    scaled_logits = diagnostics["scaled_medclip_logit"]
+    mean_unpaired_cosine = diagnostics["mean_unpaired_cosine_similarity"]
+    mean_unpaired_distance = diagnostics["mean_unpaired_cosine_distance"]
+    cosine_margin = diagnostics["matched_minus_unpaired_cosine_margin"]
+    mean_unpaired_scaled_logit = diagnostics["mean_unpaired_scaled_medclip_logit"]
+    scaled_logit_margin = diagnostics["matched_minus_unpaired_scaled_logit_margin"]
+    correct_label_percentile = diagnostics["correct_label_percentile"]
+    correct_label_rank = diagnostics["correct_label_rank"]
+
     ci_rng = np.random.default_rng(args.seed + 1)
     raw_cosine_ci = bootstrap_mean_ci(raw_cosine, ci_rng, args.bootstrap_samples)
     scaled_logit_ci = tuple(value * logit_scale for value in raw_cosine_ci)
+    mean_unpaired_cosine_ci = bootstrap_mean_ci(
+        mean_unpaired_cosine,
+        ci_rng,
+        args.bootstrap_samples,
+    )
+    mean_unpaired_distance_ci = (
+        1.0 - mean_unpaired_cosine_ci[1],
+        1.0 - mean_unpaired_cosine_ci[0],
+    )
+    cosine_margin_ci = bootstrap_mean_ci(cosine_margin, ci_rng, args.bootstrap_samples)
+    mean_unpaired_scaled_logit_ci = tuple(
+        value * logit_scale for value in mean_unpaired_cosine_ci
+    )
+    scaled_logit_margin_ci = tuple(value * logit_scale for value in cosine_margin_ci)
+    correct_label_percentile_ci = bootstrap_mean_ci(
+        correct_label_percentile,
+        ci_rng,
+        args.bootstrap_samples,
+    )
+    correct_label_rank_ci = bootstrap_mean_ci(correct_label_rank, ci_rng, args.bootstrap_samples)
 
     output = frame.copy()
-    output["raw_cosine_similarity"] = raw_cosine
-    output["scaled_medclip_logit"] = scaled_logits
+    for column, values in diagnostics.items():
+        output[column] = values
     keep_columns = [
         column
         for column in [
@@ -403,19 +496,27 @@ def main() -> None:
             "prompt",
             "raw_cosine_similarity",
             "scaled_medclip_logit",
+            "mean_unpaired_cosine_similarity",
+            "mean_unpaired_cosine_distance",
+            "matched_minus_unpaired_cosine_margin",
+            "mean_unpaired_scaled_medclip_logit",
+            "matched_minus_unpaired_scaled_logit_margin",
+            "correct_label_percentile",
+            "correct_label_rank",
         ]
         if column in output.columns
     ]
     output[keep_columns].to_csv(args.output_dir / "similarity_per_pair.csv", index=False)
-    plot_similarity_distributions(
+    plot_similarity_diagnostics(
         raw_cosine,
-        scaled_logits,
+        mean_unpaired_cosine,
+        cosine_margin,
         args.output_dir / "similarity_distribution.png",
     )
 
     summary = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "metric": "MedCLIP similarity for matched image/prompt pairs only",
+        "metric": "MedCLIP matched similarity with an all-other-label diagnostic baseline",
         "model": "MedCLIP-ViT",
         "medclip_git_revision": MEDCLIP_REVISION,
         "input_source": input_summary,
@@ -430,6 +531,46 @@ def main() -> None:
         },
         "raw_cosine_similarity": similarity_summary(raw_cosine, raw_cosine_ci),
         "scaled_medclip_logit": similarity_summary(scaled_logits, scaled_logit_ci),
+        "all_other_labels_diagnostic": {
+            "definition": (
+                "For each image, compare its matched label with the mean of every other label; "
+                "unpaired labels are not assumed to be medically negative."
+            ),
+            "mean_unpaired_cosine_similarity": similarity_summary(
+                mean_unpaired_cosine,
+                mean_unpaired_cosine_ci,
+            ),
+            "mean_unpaired_cosine_distance": similarity_summary(
+                mean_unpaired_distance,
+                mean_unpaired_distance_ci,
+            ),
+            "matched_minus_unpaired_cosine_margin": similarity_summary(
+                cosine_margin,
+                cosine_margin_ci,
+            ),
+            "mean_unpaired_scaled_medclip_logit": similarity_summary(
+                mean_unpaired_scaled_logit,
+                mean_unpaired_scaled_logit_ci,
+            ),
+            "matched_minus_unpaired_scaled_logit_margin": similarity_summary(
+                scaled_logit_margin,
+                scaled_logit_margin_ci,
+            ),
+            "correct_label_percentile": similarity_summary(
+                correct_label_percentile,
+                correct_label_percentile_ci,
+            ),
+            "correct_label_rank": similarity_summary(
+                correct_label_rank,
+                correct_label_rank_ci,
+            ),
+            "interpretation": {
+                "cosine_margin": "Positive is better; zero means no average separation.",
+                "cosine_distance": "Higher means farther from the unpaired labels.",
+                "correct_label_percentile": "100 is best; 50 is chance-level ordering.",
+                "correct_label_rank": "1 is best.",
+            },
+        },
         "software": {
             "torch": package_version("torch"),
             "transformers": package_version("transformers"),
@@ -445,7 +586,8 @@ def main() -> None:
             "distribution_figure": "similarity_distribution.png",
         },
         "limitations": [
-            "Only matched image/prompt pairs are scored; no negative comparison is performed.",
+            "Other labels are an unpaired diagnostic baseline, not verified medical negatives.",
+            "Repeated or semantically similar reports can reduce the margin and rank metrics.",
             "Absolute cosine similarity and scaled logits have no universal pass/fail threshold.",
             "Use the same dataset and settings when comparing real, base-model, and fine-tuned images.",
         ],

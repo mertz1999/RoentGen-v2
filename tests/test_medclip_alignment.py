@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from roentgenv2.evaluation.medclip_alignment import (
+    all_other_label_diagnostics,
     load_prompt_dir_pairs,
     paired_similarities,
     preprocess_medclip_image,
@@ -35,6 +36,62 @@ class MedclipAlignmentTests(unittest.TestCase):
     def test_paired_similarities_reject_mismatched_embedding_shapes(self):
         with self.assertRaisesRegex(ValueError, "must have the same shape"):
             paired_similarities(np.zeros((2, 3)), np.zeros((1, 3)), 10.0)
+
+    def test_all_other_label_diagnostics_use_every_unpaired_label(self):
+        image_embeddings = np.eye(3)
+        text_embeddings = np.array(
+            [
+                [0.8, 0.1, 0.2],
+                [0.3, 0.7, 0.4],
+                [0.5, 0.6, 0.9],
+            ]
+        )
+
+        diagnostics = all_other_label_diagnostics(
+            image_embeddings,
+            text_embeddings,
+            logit_scale=10.0,
+        )
+
+        np.testing.assert_allclose(diagnostics["raw_cosine_similarity"], [0.8, 0.7, 0.9])
+        np.testing.assert_allclose(diagnostics["mean_unpaired_cosine_similarity"], [0.4, 0.35, 0.3])
+        np.testing.assert_allclose(diagnostics["mean_unpaired_cosine_distance"], [0.6, 0.65, 0.7])
+        np.testing.assert_allclose(
+            diagnostics["matched_minus_unpaired_cosine_margin"],
+            [0.4, 0.35, 0.6],
+        )
+        np.testing.assert_allclose(
+            diagnostics["mean_unpaired_scaled_medclip_logit"],
+            [4.0, 3.5, 3.0],
+        )
+        np.testing.assert_allclose(
+            diagnostics["matched_minus_unpaired_scaled_logit_margin"],
+            [4.0, 3.5, 6.0],
+        )
+        np.testing.assert_allclose(diagnostics["correct_label_percentile"], [100.0] * 3)
+        np.testing.assert_allclose(diagnostics["correct_label_rank"], [1.0] * 3)
+
+    def test_all_other_label_diagnostics_use_midranks_for_tied_labels(self):
+        image_embeddings = np.array([[1.0, 0.0], [0.0, 1.0]])
+        text_embeddings = np.array([[1.0, 0.0], [1.0, 0.0]])
+
+        diagnostics = all_other_label_diagnostics(
+            image_embeddings,
+            text_embeddings,
+            logit_scale=10.0,
+        )
+
+        np.testing.assert_allclose(diagnostics["matched_minus_unpaired_cosine_margin"], [0.0, 0.0])
+        np.testing.assert_allclose(diagnostics["correct_label_percentile"], [50.0, 50.0])
+        np.testing.assert_allclose(diagnostics["correct_label_rank"], [1.5, 1.5])
+
+    def test_all_other_label_diagnostics_require_two_pairs(self):
+        with self.assertRaisesRegex(ValueError, "At least two"):
+            all_other_label_diagnostics(
+                np.array([[1.0, 0.0]]),
+                np.array([[1.0, 0.0]]),
+                logit_scale=10.0,
+            )
 
     def test_prompt_directory_matches_exact_and_inference_image_names(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
